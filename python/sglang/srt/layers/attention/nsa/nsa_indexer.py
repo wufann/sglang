@@ -84,7 +84,10 @@ class BaseIndexerMetadata(ABC):
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.bfloat16
-    from sgl_kernel import hadamard_transform
+    if is_hip():
+        from fast_hadamard_transform import hadamard_transform
+    else:
+        from sgl_kernel import hadamard_transform
 
     hidden_size = x.size(-1)
     assert (
@@ -169,7 +172,7 @@ class Indexer(CustomOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-    @torch.compile(dynamic=True)
+    # @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
         weights, _ = self.weights_proj(x.float())
         weights = weights * self.n_heads**-0.5
@@ -225,6 +228,9 @@ class Indexer(CustomOp):
         q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
         query[..., : self.rope_head_dim] = q_rope
+        # print(f"k_rope shape: {k_rope.shape}")
+        # print(f"key shape: {key.shape}")
+        # print(f"self.rope_head_dim: {self.rope_head_dim}")
         key[..., : self.rope_head_dim] = k_rope
 
         # allgather+rerrange
@@ -809,6 +815,7 @@ class Indexer(CustomOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
+        # print(f"x in forward_cuda: {x}")
         if is_hip():
             from sglang.srt.layers.attention.nsa.tilelang_kernel import act_quant
         elif not is_npu():
@@ -842,17 +849,17 @@ class Indexer(CustomOp):
                 skip_logits_computation = max_kv_len <= self.index_topk
 
         # Optimization: fast path when skipping topk computation
-        if skip_logits_computation and (not self.nsa_enable_prefill_cp):
-            return self._forward_cuda_k_only(
-                x,
-                positions,
-                forward_batch,
-                layer_id,
-                act_quant,
-                enable_dual_stream,
-                metadata,
-                return_indices,
-            )
+        # if skip_logits_computation and (not self.nsa_enable_prefill_cp):
+        #     return self._forward_cuda_k_only(
+        #         x,
+        #         positions,
+        #         forward_batch,
+        #         layer_id,
+        #         act_quant,
+        #         enable_dual_stream,
+        #         metadata,
+        #         return_indices,
+        #     )
 
         query, key = self._get_q_k_bf16(
             q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch

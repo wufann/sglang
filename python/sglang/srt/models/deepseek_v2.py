@@ -1697,6 +1697,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
+        # print(f"forward_normal_prepare hidden_states: {hidden_states}")
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -1752,27 +1753,27 @@ class DeepseekV2AttentionMLA(nn.Module):
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
 
-        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+        # if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
 
-            kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
-                kv_a,
-                self.kv_a_layernorm.weight,
-                self.kv_a_layernorm.variance_epsilon,
-                None,
-                None,
-                None,
-                group_size=128,
-                dtype_quant=torch.float8_e4m3fn,
-                res1=None,
-                output_unquantized_inp1=True,  # return unqaunt kv_a
-            )
-            kv = self.kv_b_proj(
-                kv_a_quanted,
-            )[0]
+        #     kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
+        #         kv_a,
+        #         self.kv_a_layernorm.weight,
+        #         self.kv_a_layernorm.variance_epsilon,
+        #         None,
+        #         None,
+        #         None,
+        #         group_size=128,
+        #         dtype_quant=torch.float8_e4m3fn,
+        #         res1=None,
+        #         output_unquantized_inp1=True,  # return unqaunt kv_a
+        #     )
+        #     kv = self.kv_b_proj(
+        #         kv_a_quanted,
+        #     )[0]
 
-        else:
-            kv_a = self.kv_a_layernorm(kv_a)
-            kv = self.kv_b_proj(kv_a)[0]
+        # else:
+        kv_a = self.kv_a_layernorm(kv_a)
+        # kv = self.kv_b_proj(kv_a)[0]
 
         # kv_a = self.kv_a_layernorm(kv_a)
 
@@ -1846,6 +1847,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        # print(f"forward_absorb_prepare hidden_states: {hidden_states}")
 
         q_lora = None
         if self.q_lora_rank is not None:
@@ -1868,37 +1870,37 @@ class DeepseekV2AttentionMLA(nn.Module):
                     k_nope = self.kv_a_layernorm(k_nope)
                 current_stream.wait_stream(self.alt_stream)
             else:
-                if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
-                    q, _, k_nope, *_ = fused_rms_mxfp4_quant(
-                        q,
-                        self.q_a_layernorm.weight,
-                        self.q_a_layernorm.variance_epsilon,
-                        k_nope,
-                        self.kv_a_layernorm.weight,
-                        self.kv_a_layernorm.variance_epsilon,
-                    )
-                else:
-                    if (
-                        _use_aiter_gfx95
-                        and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
-                    ):
+                # if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
+                #     q, _, k_nope, *_ = fused_rms_mxfp4_quant(
+                #         q,
+                #         self.q_a_layernorm.weight,
+                #         self.q_a_layernorm.variance_epsilon,
+                #         k_nope,
+                #         self.kv_a_layernorm.weight,
+                #         self.kv_a_layernorm.variance_epsilon,
+                #     )
+                # else:
+                #     if (
+                #         _use_aiter_gfx95
+                #         and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
+                #     ):
 
-                        q, _, k_nope, _ = fused_rms_fp8_group_quant(
-                            q,
-                            self.q_a_layernorm.weight,
-                            self.q_a_layernorm.variance_epsilon,
-                            k_nope,
-                            self.kv_a_layernorm.weight,
-                            self.kv_a_layernorm.variance_epsilon,
-                            group_size=128,
-                            dtype_quant=torch.float8_e4m3fn,
-                            res1=None,
-                            output_unquantized_inp1=False,
-                        )
+                #         q, _, k_nope, _ = fused_rms_fp8_group_quant(
+                #             q,
+                #             self.q_a_layernorm.weight,
+                #             self.q_a_layernorm.variance_epsilon,
+                #             k_nope,
+                #             self.kv_a_layernorm.weight,
+                #             self.kv_a_layernorm.variance_epsilon,
+                #             group_size=128,
+                #             dtype_quant=torch.float8_e4m3fn,
+                #             res1=None,
+                #             output_unquantized_inp1=False,
+                #         )
 
-                    else:
-                        q = self.q_a_layernorm(q)
-                        k_nope = self.kv_a_layernorm(k_nope)
+                    # else:
+                q = self.q_a_layernorm(q)
+                k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
             if self.use_nsa:

@@ -1372,7 +1372,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         return tilelang_sparse_fwd(
             q=q_all,
             kv=kv_cache,
-            indices=page_table_1.unsqueeze(1),
+            indices=page_table_1.unsqueeze(1).to(torch.int32),
             sm_scale=sm_scale,
             d_v=v_head_dim,
         )
