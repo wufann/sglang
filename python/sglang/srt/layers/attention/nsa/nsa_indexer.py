@@ -42,6 +42,10 @@ if TYPE_CHECKING:
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if is_cuda() else 0
 
+def print_rank0(*args, **kwargs):
+    import torch.distributed as dist
+    if dist.get_rank() == 0:
+        print(*args, **kwargs, flush=True)
 
 class BaseIndexerMetadata(ABC):
     @abstractmethod
@@ -547,6 +551,8 @@ class Indexer(CustomOp):
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
         assert forward_batch.forward_mode.is_extend_without_speculative()
+        # print_rank0(f"{forward_batch.forward_mode}")
+        # print_rank0(f"x in _forward_cuda_k_only: {x}")
 
         # Fast path: only compute and store k cache, skip all q and weights ops
         key = self._get_k_bf16(x, positions, enable_dual_stream)
@@ -755,6 +761,7 @@ class Indexer(CustomOp):
         block_tables = block_tables[:, strided_indices] // page_size
 
         q_len_start = 0
+        print_rank0(f"block_table: {block_tables}")
 
         for i in range(forward_batch.batch_size):
             seq_len = forward_batch.seq_lens[i].item()
@@ -784,6 +791,10 @@ class Indexer(CustomOp):
 
             k_fp8 = k_fp8.view(torch.float8_e4m3fn).unsqueeze(0).contiguous()
             k_scale = k_scale.view(torch.float32).squeeze(-1).unsqueeze(0).contiguous()
+            print_rank0(f"q_fp8_partial: {q_fp8_partial} {q_fp8_partial.shape}")
+            print_rank0(f"weight_partial: {weights_partial} {weights_partial.shape}")
+            print_rank0(f"k_fp8: {k_fp8} {k_fp8.shape}")
+            print_rank0(f"k_scale: {k_scale} {k_scale.shape}")
 
             index_score = fp8_index(
                 q_fp8_partial,
@@ -791,8 +802,10 @@ class Indexer(CustomOp):
                 k_fp8,
                 k_scale,
             )
+            print_rank0(f"index_score: {index_score} {index_score.shape}")
             end_pos = seq_len
             topk_indices = index_score.topk(min(topk, end_pos), dim=-1)[1].squeeze(0)
+            print_rank0(f"topk_indices: {topk_indices} {topk_indices.shape} {topk_indices.dtype}")
 
             pad_len = ceil_align(topk_indices.shape[-1], 2048) - topk_indices.shape[-1]
             topk_indices = torch.nn.functional.pad(
@@ -828,6 +841,8 @@ class Indexer(CustomOp):
             layer_id, forward_batch
         )
 
+        # print_rank0(f"hidden_states: {x}")
+        # print_rank0(f"q_lora: {q_lora}")
         enable_dual_stream = (
             NSA_DUAL_STREAM
             and self.alt_stream is not None
@@ -964,6 +979,7 @@ class Indexer(CustomOp):
                 topk=self.index_topk,
                 layer_id=layer_id,
             )
+            print_rank0(f"topk_result: {topk_result}")
         return topk_result
 
     def forward_npu(

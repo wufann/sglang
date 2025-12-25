@@ -147,6 +147,8 @@ def fp8_index_kernel(h: int, d: int, clear_accum=True):
                 T.copy(k_s[i_b, i1_n * blk_n1 + i2_n * blk_n2], k_s_frag)
 
                 logits = T.alloc_fragment((blk_n2, h), FP32)
+                if not clear_accum:
+                    T.fill(logits, 0)
                 T.gemm(
                     k_smem,
                     q_smem,
@@ -155,6 +157,8 @@ def fp8_index_kernel(h: int, d: int, clear_accum=True):
                     transpose_B=True,
                     clear_accum=clear_accum,
                 )
+                # if i_b == 0 and i_m == 0 and i1_n == 0 and i2_n == 0:
+                #     T.print(logits)
 
                 for i_h, i3_n in T.Parallel(h, blk_n2):
                     logits[i3_n, i_h] = T.max(logits[i3_n, i_h], 0) * q_s_frag[i_h]

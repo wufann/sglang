@@ -238,6 +238,10 @@ def enable_nextn_moe_bf16_cast_to_fp8(quant_config):
         and get_moe_a2a_backend().is_deepep()
     )
 
+def print_rank0(*args, **kwargs):
+    import torch.distributed as dist
+    if dist.get_rank() == 0:
+        print(*args, **kwargs, flush=True)
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "fa3",
@@ -427,7 +431,11 @@ def handle_attention_nsa(attn, forward_batch):
     Dispatch logic is centralized in NativeSparseAttnBackend.set_nsa_prefill_impl and executed
     in init_forward_metadata. Read the decision from backend.use_mha.
     """
+    print_rank0(f"handle_attention_nsa")
     backend = forward_batch.attn_backend
+    # print_rank0(f"backend {backend}")
+    # print_rank0(f"backend {backend.use_mha}")
+    # print_rank0(f"backend {hasattr(backend, "use_mha")}")
     if hasattr(backend, "use_mha") and backend.use_mha:
         return AttnForwardMethod.MHA_ONE_SHOT
     return AttnForwardMethod.MLA
@@ -1605,6 +1613,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+        print_rank0(f"prepare attn_forward_method: {attn_forward_method}")
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
@@ -1652,6 +1661,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         if inner_state is None:
             return hidden_states
 
+        print_rank0(f"core attn_forward_method: {attn_forward_method}")
         if attn_forward_method == AttnForwardMethod.MHA:
             return self.forward_normal_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
@@ -1697,7 +1707,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
-        # print(f"forward_normal_prepare hidden_states: {hidden_states}")
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -1707,6 +1716,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                     dim=-1,
                 )
             )
+            # if torch.distributed.get_rank()==0:
+            #     print(f"forward_norm_preapre q: {q}")
+            #     print(f"forward_norm_preapre latent_cache: {latent_cache}")
 
             # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
 
@@ -1847,7 +1859,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-        # print(f"forward_absorb_prepare hidden_states: {hidden_states}")
+        print_rank0(f"forward_absorb_prepare hidden_states: {hidden_states} {hidden_states.shape}")
 
         q_lora = None
         if self.q_lora_rank is not None:
@@ -1859,6 +1871,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                     dim=-1,
                 )
             )
+            # print_rank0(f"forward_absorb_preapre q: {q}")
+            # print_rank0(f"forward_absorb_preapre latent_cache: {latent_cache}")
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
@@ -2005,6 +2019,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 latent_cache, forward_batch, k_nope, k_pe
             )
         topk_indices = None
+        #print_rank0(f"hidden_states: {hidden_states}")
+        #print_rank0(f"q_lora: {q_lora}")
         if q_lora is not None:
             topk_indices = self.indexer(
                 x=hidden_states,
@@ -2039,6 +2055,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         llama_4_scaling,
     ):
         save_kv_cache = True
+        print_rank0(f"absorb core topk_indices: {topk_indices}")
+        print_rank0(f"absorb core topk_indices shape: {topk_indices.shape}")
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
@@ -2102,6 +2120,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+        print_rank0(f"o: {attn_output}")
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
@@ -2844,6 +2863,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        print_rank0(f"decode layer =====")
         quant_format = (
             "mxfp4"
             if (
@@ -2911,6 +2931,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_reduce_scatter,
             gemm_output_zero_allocator,
         )
+        print_rank0(f"hidden_states after MOE: {hidden_states}")
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True

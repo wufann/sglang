@@ -34,6 +34,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
+def print_rank0(*args, **kwargs):
+    import torch.distributed as dist
+    if dist.get_rank() == 0:
+        print(*args, **kwargs, flush=True)
 
 _is_hip = is_hip()
 
@@ -905,6 +909,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         metadata = self.forward_metadata
         causal = not layer.is_cross_attention
         assert causal, "NSA is causal only"
+        print_rank0(f"=====enter forward_extend nsa_backend.py====")
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
@@ -976,6 +981,9 @@ class NativeSparseAttnBackend(AttentionBackend):
         if self.nsa_prefill_impl == "tilelang":
             if q_rope is not None:
                 q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
+            print_rank0(f"prefill q_all: {q_all}")
+            print_rank0(f"prefill kv cache: {kv_cache}")
+            print_rank0(f"prefill page_table_1: {page_table_1}")
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
