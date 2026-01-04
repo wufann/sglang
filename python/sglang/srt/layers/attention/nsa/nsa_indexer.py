@@ -42,6 +42,10 @@ if TYPE_CHECKING:
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if is_cuda() else 0
 
+def print_rank0(*args, **kwargs):
+    import torch.distributed as dist
+    if dist.get_rank() == 0:
+        print(*args, **kwargs, flush=True)
 
 class BaseIndexerMetadata(ABC):
     @abstractmethod
@@ -55,6 +59,12 @@ class BaseIndexerMetadata(ABC):
         """
         Return: (batch_size, num_blocks) int32, page table.
                 The page size of the table is 64.
+        """
+    @abstractmethod
+    def get_page_table_1(self) -> torch.Tensor:
+        """
+        Return: (batch_size, num_blocks) int32, page table.
+                The page size of the table is 1.
         """
 
     @abstractmethod
@@ -84,7 +94,11 @@ class BaseIndexerMetadata(ABC):
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.bfloat16
-    from sgl_kernel import hadamard_transform
+    # from sgl_kernel import hadamard_transform
+    if is_hip():
+        from fast_hadamard_transform import hadamard_transform
+    else:
+        from sgl_kernel import hadamard_transform
 
     hidden_size = x.size(-1)
     assert (
@@ -169,7 +183,7 @@ class Indexer(CustomOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-    @torch.compile(dynamic=True)
+    # @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
         weights, _ = self.weights_proj(x.float())
         weights = weights * self.n_heads**-0.5
@@ -277,6 +291,15 @@ class Indexer(CustomOp):
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
+        # token_nums = q_fp8.shape[0]
+        # device = q_fp8.device 
+        # topk_result = torch.full(
+        #         (token_nums, self.index_topk),
+        #         -1,
+        #         device=device,
+        #         dtype=torch.int32,
+        #     )
+        # return topk_result
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
@@ -285,9 +308,11 @@ class Indexer(CustomOp):
         assert page_size == 64, "only support page size 64"
 
         # NOTE(dark): this support extend/decode/decode+graph
-        block_tables = metadata.get_page_table_64()
+        # block_tables = metadata.get_page_table_64()
+        block_tables = metadata.get_page_table_1()
 
-        max_seq_len = block_tables.shape[1] * page_size
+        # max_seq_len = block_tables.shape[1] * page_size
+        max_seq_len = block_tables.shape[1] * 1
         kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
             layer_id=layer_id
         )
@@ -302,37 +327,70 @@ class Indexer(CustomOp):
             seqlens_32 = metadata.get_seqlens_int32()
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
-        schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
-        if schedule_metadata is None:
-            schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                seqlens_32, blocksize, self.sm_count
-            )
+        # schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
+        # if schedule_metadata is None:
+        #     schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+        #         seqlens_32, blocksize, self.sm_count
+        #     )
+        # print_rank0(f"seqlens_32: {seqlens_32}")
+        # print_rank0(f"max_seq_len: {max_seq_len}")
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
         assert len(kv_cache_fp8.shape) == 2
-        block_kv = 64
+        block_kv = 1
         num_heads_kv = 1
         head_dim_with_sf = 132
         kv_cache_fp8 = kv_cache_fp8.view(
-            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+            kv_cache_fp8.shape[0]*64, block_kv, num_heads_kv, head_dim_with_sf
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        logits = deep_gemm.fp8_paged_mqa_logits(
-            q_fp8,
-            kv_cache_fp8,
-            weights,
-            seqlens_32,
-            block_tables,
-            schedule_metadata,
-            max_seq_len,
-            clean_logits=False,
+        # logits = deep_gemm.fp8_paged_mqa_logits(
+        #     q_fp8,
+        #     kv_cache_fp8,
+        #     weights,
+        #     seqlens_32,
+        #     block_tables,
+        #     schedule_metadata,
+        #     max_seq_len,
+        #     clean_logits=False,
+        # )
+        from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+
+        batch_size, next_n, heads, _ = q_fp8.shape
+        logits = torch.full(
+            (heads, batch_size * next_n, max_seq_len),
+            float("-inf"),
+            device=q_fp8.device,
+            dtype=torch.float32,
         )
+        # print_rank0(f"paged_mqa q_fp8: {q_fp8.shape} {q_fp8.dtype}")
+        # print_rank0(f"paged_mqa kv_cache_fp8: {kv_cache_fp8.shape} {kv_cache_fp8.dtype}")
+        # print_rank0(f"paged_mqa weights: {weights.shape} {weights.dtype}")
+        # print_rank0(f"paged_mqa seqlens_32: {seqlens_32} {seqlens_32.shape} {seqlens_32.dtype}")
+        # print_rank0(f"paged_mqa block_tables: {block_tables} {block_tables.shape} {block_tables.dtype}")
+        # print_rank0(f"paged_mqa max_model_len: {max_seq_len}")
+        # print_rank0(f"paged_mqa blocksize: {blocksize}")
+        deepgemm_fp8_paged_mqa_logits(
+           q_fp8,
+           kv_cache_fp8,
+           weights,
+           logits,
+           seqlens_32,
+           block_tables,
+           max_seq_len,
+           False,
+           block_kv
+        )
+        # logits.sum(dim=0)
+        # return out_qk.sum(dim=0)
+        # print_rank0(f"logits xixii {logits}")
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        topk_result = metadata.topk_transform(logits.sum(dim=0), self.index_topk)
+        # print_rank0(f"topk xixi {topk_result}")
         return topk_result
 
     def _should_chunk_mqa_logits(
@@ -362,6 +420,15 @@ class Indexer(CustomOp):
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
+        # token_nums = q_fp8.shape[0]
+        # device = q_fp8.device 
+        # topk_result = torch.full(
+        #         (token_nums, self.index_topk),
+        #         -1,
+        #         device=device,
+        #         dtype=torch.int32,
+        #     )
+        # return topk_result
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
@@ -439,14 +506,40 @@ class Indexer(CustomOp):
         need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
 
         if not need_chunk:
-            logits = deep_gemm.fp8_mqa_logits(
-                q_fp8[:q_offset],
-                kv_fp8,
-                weights[:q_offset],
-                ks,
-                ke,
-                clean_logits=False,
-            )
+            # print_rank0(f"q_fp8: {q_fp8} {q_fp8.shape}")
+            # print_rank0(f"k_fp8: {kv_fp8[0]} {kv_fp8[0].shape}")
+            # print_rank0(f"k_scale: {kv_fp8[1]} {kv_fp8[1].shape}")
+            # print_rank0(f"weighs: {weights} {weights.shape}")
+            # print_rank0(f"ks: {ks} {ks.shape}")
+            # print_rank0(f"ke: {ke} {ke.shape}")
+            # token_nums = q_fp8.shape[0]
+            # device = q_fp8.device 
+            # topk_result = torch.full(
+            #         (token_nums, self.index_topk),
+            #         -1,
+            #         device=device,
+            #         dtype=torch.int32,
+            #     )
+            # return topk_result
+            if is_cuda():
+                logits = deep_gemm.fp8_mqa_logits(
+                    q_fp8[:q_offset],
+                    kv_fp8,
+                    weights[:q_offset],
+                    ks,
+                    ke,
+                    clean_logits=False,
+                )
+            else:
+                from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+                kv, scale = kv_fp8
+                logits = fp8_mqa_logits(q_fp8[:q_offset],
+                                    kv,
+                                    scale,
+                                    weights[:q_offset],
+                                    ks,
+                                    ke)
+            print_rank0(f"logis: {logits} {logits.shape}")
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
@@ -800,7 +893,7 @@ class Indexer(CustomOp):
 
             q_len_start = q_len_end
 
-        topk_indices = torch.cat(topk_indices_list, dim=0)
+        topk_indices = torch.cat(topk_indices_list, dim=0).to(torch.int32)
         return topk_indices
 
     def forward_cuda(
@@ -888,7 +981,7 @@ class Indexer(CustomOp):
 
         weights = self._get_logits_head_gate(x, q_scale)
 
-        if is_cuda():
+        if is_cuda() or is_hip():
             assert forward_batch.seq_lens_cpu is not None
             if len(forward_batch.seq_lens_cpu) == 0:
                 # this seems b/c max-pad, no worries?
@@ -905,6 +998,7 @@ class Indexer(CustomOp):
                 or forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend(include_v2=True)
             ):
+                # print_rank0(f"===topk_paged===")
                 topk_result = self._get_topk_paged(
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )
@@ -949,6 +1043,7 @@ class Indexer(CustomOp):
                     )
                     return torch.cat([topk_result_prev, topk_result_next], dim=0)
                 else:
+                    # print_rank0(f"===topk_ragged===")
                     topk_result = self._get_topk_ragged(
                         forward_batch, layer_id, q_fp8, weights, metadata
                     )
@@ -960,6 +1055,7 @@ class Indexer(CustomOp):
                 topk=self.index_topk,
                 layer_id=layer_id,
             )
+        # print_rank0(f"topk_result: {topk_result}")
         return topk_result
 
     def forward_npu(

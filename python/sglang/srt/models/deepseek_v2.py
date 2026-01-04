@@ -231,6 +231,10 @@ _is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
 
 logger = logging.getLogger(__name__)
 
+def print_rank0(*args, **kwargs):
+    import torch.distributed as dist
+    if dist.get_rank() == 0:
+        print(*args, **kwargs, flush=True)
 
 def enable_nextn_moe_bf16_cast_to_fp8(quant_config):
     return (
@@ -1891,27 +1895,27 @@ class DeepseekV2AttentionMLA(nn.Module):
                         self.kv_a_layernorm.variance_epsilon,
                     )
                 else:
-                    if (
-                        _use_aiter_gfx95
-                        and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
-                    ):
+                    # if (
+                    #     _use_aiter_gfx95
+                    #     and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
+                    # ):
 
-                        q, _, k_nope, _ = fused_rms_fp8_group_quant(
-                            q,
-                            self.q_a_layernorm.weight,
-                            self.q_a_layernorm.variance_epsilon,
-                            k_nope,
-                            self.kv_a_layernorm.weight,
-                            self.kv_a_layernorm.variance_epsilon,
-                            group_size=128,
-                            dtype_quant=torch.float8_e4m3fn,
-                            res1=None,
-                            output_unquantized_inp1=False,
-                        )
+                    #     q, _, k_nope, _ = fused_rms_fp8_group_quant(
+                    #         q,
+                    #         self.q_a_layernorm.weight,
+                    #         self.q_a_layernorm.variance_epsilon,
+                    #         k_nope,
+                    #         self.kv_a_layernorm.weight,
+                    #         self.kv_a_layernorm.variance_epsilon,
+                    #         group_size=128,
+                    #         dtype_quant=torch.float8_e4m3fn,
+                    #         res1=None,
+                    #         output_unquantized_inp1=False,
+                    #     )
 
-                    else:
-                        q = self.q_a_layernorm(q)
-                        k_nope = self.kv_a_layernorm(k_nope)
+                    # else:
+                    q = self.q_a_layernorm(q)
+                    k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
             if self.use_nsa:
@@ -2902,6 +2906,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
             llama_4_scaling=llama_4_scaling,
         )
+        # print_rank0(f"attn: {hidden_states}")
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -2928,6 +2933,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_reduce_scatter,
             gemm_output_zero_allocator,
         )
+        # print_rank0(f"moe: {hidden_states}")
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
