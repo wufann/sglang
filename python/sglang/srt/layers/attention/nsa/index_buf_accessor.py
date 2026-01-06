@@ -348,11 +348,11 @@ def _set_k_and_s_triton(
             f"index_k_scale must be 1D or 2D, got shape {index_k_scale.shape}"
         )
 
-    assert buf_numel_per_page == 64 * (128 + 4)
+    assert buf_numel_per_page == 1* (128 + 4)
     assert num_tokens_to_write == num_tokens_to_write_ == num_tokens_to_write__
     assert index_head_dim == 128
     assert scale_dim == 1
-    assert page_size == 64
+    assert page_size == 1
 
     assert buf.dtype == torch.uint8
     assert loc.dtype == torch.int64, f"{loc.dtype=}"  # can be int32

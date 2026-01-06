@@ -174,6 +174,9 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
     def get_page_table_64(self) -> torch.Tensor:
         return self.attn_metadata.real_page_table
 
+    def get_page_table_1(self) -> torch.Tensor:
+        return self.attn_metadata.page_table_1
+
     def get_seqlens_expanded(self) -> torch.Tensor:
         return self.attn_metadata.nsa_seqlens_expanded
 
@@ -888,7 +891,6 @@ class NativeSparseAttnBackend(
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
-
         metadata = NSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
