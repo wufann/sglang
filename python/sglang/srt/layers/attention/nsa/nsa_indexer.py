@@ -310,10 +310,9 @@ class Indexer(MultiPlatformOp):
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
         page_size = forward_batch.token_to_kv_pool.page_size
-        #page_size = 1
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
-        assert page_size == 64, "only support page size 64"
-        # assert page_size == 1, "only support page size 1"
+        # assert page_size == 64, "only support page size 64"
+        assert page_size == 1, "only support page size 1"
 
         # NOTE(dark): this support extend/decode/decode+graph
         # block_tables = metadata.get_page_table_64()
@@ -349,7 +348,8 @@ class Indexer(MultiPlatformOp):
         num_heads_kv = 1
         head_dim_with_sf = 132
         kv_cache_fp8 = kv_cache_fp8.view(
-            kv_cache_fp8.shape[0]*64, block_kv, num_heads_kv, head_dim_with_sf
+            -1, block_kv, num_heads_kv, head_dim_with_sf
+            # kv_cache_fp8.shape[0]*64, block_kv, num_heads_kv, head_dim_with_sf
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)

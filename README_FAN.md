@@ -35,7 +35,7 @@ python3 -m sglang.launch_server --model /models/DeepSeek-V3.2-Exp \
         --trust-remote-code \
         --nsa-prefill-backend tilelang \
         --nsa-decode-backend tilelang \
-        --disable-cuda-graph
+        --cuda-graph-max-bs 64
 
 或者
 
@@ -55,7 +55,7 @@ cd sglang/benchmark/gsm8k
 python3 bench_sglang.py --num-questions 1319 --port 10086
 
 精度结果：
-"accuracy": 0.955
+"accuracy": 0.957
 
 # curl 单条prompt 
 curl http://localhost:10086/generate \
@@ -68,11 +68,29 @@ curl http://localhost:10086/generate \
 
 # 6. TODO
 ## 框架
-- 开cuda graph会crash
+- cuda graph
+使用aiter sparse attention 无法开启cuda graph
+```
+@/python/sglang/srt/layers/attention/nsa_backend.py
+        q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
 
-crash到了deepgemm_fp8_paged_mqa_logits算子上。
+        if layer.head_dim != layer.v_head_dim:
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+        else:
+            o = torch.empty_like(q)
 
-检查attention的matadata是否配置正确。
+        kv_indptr = self.kv_indptr
+
+        non_minus1_mask = page_table_1 != -1
+        non_minus1_counts = non_minus1_mask.sum(dim=1)
+        kv_indptr[1 : bs + 1] = torch.cumsum(non_minus1_counts, dim=0)
+
+        kv_indices = page_table_1[page_table_1 != -1]
+```
+
+使用tilelang的sparse attention，最高支持到 --cuda-graph-max-bs 64，大于bs64发生crash
+
+检查metadata是否配置正确，init_cuda_graph_state，init_forward_metadata_capture_cuda_graph，init_forward_metadata_replay_cuda_graph。
 
 ## 算子
 - tilelang实现的sparse attn有随机性，每次返回的结果不一样。

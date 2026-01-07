@@ -894,7 +894,6 @@ class NativeSparseAttnBackend(
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
-
         metadata = NSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
