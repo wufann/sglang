@@ -426,13 +426,15 @@ class Indexer(MultiPlatformOp):
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
         page_size = forward_batch.token_to_kv_pool.page_size
-        assert page_size == 64, "only support page size 64"
+        # assert page_size == 64, "only support page size 64"
+        assert page_size == 1, "only support page size 1"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
         k_fp8_list = []
         k_scale_list = []
 
-        block_tables = metadata.get_page_table_64()
+        # block_tables = metadata.get_page_table_64()
+        block_tables = metadata.get_page_table_1()
 
         assert (
             forward_batch.seq_lens_cpu is not None
@@ -521,15 +523,24 @@ class Indexer(MultiPlatformOp):
         start = 0
         while start < q_offset:
             end = min(start + max_rows, q_offset)
-
-            logits_chunk = deep_gemm.fp8_mqa_logits(
-                q_fp8[start:end],
-                kv_fp8,
-                weights[start:end],
-                ks[start:end],
-                ke[start:end],
-                clean_logits=False,
+            if is_cuda():
+                logits_chunk = deep_gemm.fp8_mqa_logits(
+                    q_fp8[start:end],
+                    kv_fp8,
+                    weights[start:end],
+                    ks[start:end],
+                    ke[start:end],
+                    clean_logits=False,
             )
+            else:
+                from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+                kv, scale = kv_fp8
+                logits = fp8_mqa_logits(q_fp8[start:end],
+                                    kv_fp8,
+                                    scale,
+                                    weights[start:end],
+                                    ks[start:end],
+                                    ke[start:end])
 
             lengths_chunk = seq_lens_expanded[start:end]
 
