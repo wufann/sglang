@@ -13,6 +13,17 @@
 # ==============================================================================
 """ModelRunner runs the forward passes of the models."""
 
+# V3.2 DEBUG LOGGING
+import logging as _logging
+_v32_debug_logger = _logging.getLogger("V32_DEBUG")
+
+def _v32_log_debug_tp0(msg: str):
+    """Only log on TP0 to reduce log spam"""
+    import torch.distributed as dist
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+    _v32_debug_logger.debug(msg)
+
 import datetime
 import gc
 import inspect
@@ -2119,12 +2130,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        _v32_log_debug_tp0(f"[ModelRunner.forward_decode] ENTER, batch_size={forward_batch.batch_size}, skip_attn_backend_init={skip_attn_backend_init}")
         if not skip_attn_backend_init:
             if self.server_args.enable_pdmux:
+                _v32_log_debug_tp0(f"[ModelRunner.forward_decode] calling decode_attn_backend.init_forward_metadata (pdmux)")
                 self.decode_attn_backend.init_forward_metadata(forward_batch)
                 forward_batch.attn_backend = self.decode_attn_backend
             else:
+                _v32_log_debug_tp0(f"[ModelRunner.forward_decode] calling attn_backend.init_forward_metadata, backend={type(self.attn_backend).__name__}")
                 self.attn_backend.init_forward_metadata(forward_batch)
+                _v32_log_debug_tp0(f"[ModelRunner.forward_decode] init_forward_metadata completed")
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
@@ -2253,8 +2268,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )
+        _v32_log_debug_tp0(f"[ModelRunner._forward_raw] can_run_graph={can_run_graph}, graph_runner={self.graph_runner is not None}, forward_mode={forward_batch.forward_mode}")
 
         if can_run_graph:
+            _v32_log_debug_tp0(f"[ModelRunner._forward_raw] using graph_runner.replay()")
             ret = self.graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,

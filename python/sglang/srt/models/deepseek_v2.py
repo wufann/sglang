@@ -42,6 +42,24 @@ from sglang.srt.configs.model_config import (
     get_nsa_index_topk,
     is_deepseek_nsa,
 )
+
+# V3.2 DEBUG LOGGING
+import logging
+_v32_debug_logger = logging.getLogger("V32_DEBUG")
+_v32_debug_logger.setLevel(logging.DEBUG)
+if not _v32_debug_logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter('[V32_DEBUG %(asctime)s] %(message)s'))
+    _v32_debug_logger.addHandler(_handler)
+
+def _v32_log_debug_layer0(layer_id: int, msg: str):
+    """Only log on TP0 and layer_id=0 to reduce log spam"""
+    import torch.distributed as dist
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+    if layer_id != 0:
+        return
+    _v32_debug_logger.debug(msg)
 from sglang.srt.distributed import (
     divide,
     get_moe_expert_parallel_world_size,
@@ -1302,6 +1320,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_tp_size = get_attention_tp_size()
         self.use_nsa = is_deepseek_nsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        _v32_log_debug_layer0(layer_id, f"[MLA.__init__] layer_id={layer_id}, use_nsa={self.use_nsa}, nsa_enable_prefill_cp={self.nsa_enable_prefill_cp}")
         if self.nsa_enable_prefill_cp:
             assert self.use_nsa, "CP currently only supports deepseek v3.2 model"
         # cp reuse the attn_tp comm group but need to duplicate the weights
@@ -1359,6 +1378,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
 
         if self.use_nsa:
+            _v32_log_debug_layer0(layer_id, f"[MLA.__init__] Creating Indexer for layer_id={layer_id}, index_n_heads={get_nsa_index_n_heads(config)}, index_head_dim={get_nsa_index_head_dim(config)}, index_topk={get_nsa_index_topk(config)}")
             self.indexer = Indexer(
                 hidden_size=hidden_size,
                 index_n_heads=get_nsa_index_n_heads(config),
@@ -1376,6 +1396,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 layer_id=layer_id,
                 alt_stream=alt_stream,
             )
+            _v32_log_debug_layer0(layer_id, f"[MLA.__init__] Indexer created successfully for layer_id={layer_id}")
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -1715,18 +1736,26 @@ class DeepseekV2AttentionMLA(nn.Module):
             # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
 
             if self.use_nsa:
+                _v32_log_debug_layer0(self.layer_id, f"[MLA.forward_absorb] layer_id={self.layer_id}, calling NSA Indexer, hidden_states.shape={hidden_states.shape}, positions.shape={positions.shape}, q.shape={q.shape}")
                 q_lora = self.q_a_layernorm(q)
+                _v32_log_debug_layer0(self.layer_id, f"[MLA.forward_absorb] layer_id={self.layer_id}, q_lora.shape={q_lora.shape}, dtype={q_lora.dtype}")
                 q = self.q_b_proj(q_lora)[0].view(
                     -1, self.num_local_heads, self.qk_head_dim
                 )
-                _ = self.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
-                    return_indices=False,
-                )
+                _v32_log_debug_layer0(self.layer_id, f"[MLA.forward_absorb] layer_id={self.layer_id}, q after q_b_proj.shape={q.shape}, dtype={q.dtype}")
+                try:
+                    _ = self.indexer(
+                        x=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        layer_id=self.layer_id,
+                        return_indices=False,
+                    )
+                    _v32_log_debug_layer0(self.layer_id, f"[MLA.forward_absorb] layer_id={self.layer_id}, Indexer call completed successfully")
+                except Exception as e:
+                    _v32_log_debug_layer0(self.layer_id, f"[MLA.forward_absorb] layer_id={self.layer_id}, Indexer call FAILED: {e}")
+                    raise
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                 # MXFP4: fused RMSNorm + quant
                 q, _, _, _ = fused_rms_mxfp4_quant(
