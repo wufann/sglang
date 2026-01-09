@@ -14,14 +14,15 @@ from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 ###############################################################################
 # CONFIG
 ###############################################################################
-ENDPOINT_URL = "http://127.0.0.1:30000"
-TOKENIZER_DIR = "/models/meta-llama/Llama-3.2-3B"
+ENDPOINT_URL = "http://127.0.0.1:10086"
+# TOKENIZER_DIR = "/models/DeepSeek-V3.2-Exp"
+TOKENIZER_DIR = "/models/DeepSeek-R1-0528"
 
 # Benchmark configurations
 NUM_REQUESTS = 10  # Total number of requests (each with BATCH_SIZE prompts)
-NUM_TOKENS = 32000  # Tokens per prompt
-BATCH_SIZE = 8  # Number of prompts per request
-GEN_TOKENS = 0  # Tokens to generate per prompt
+NUM_TOKENS = 1024  # Tokens per prompt
+BATCH_SIZE = 1024  # Number of prompts per request
+GEN_TOKENS = 10  # Tokens to generate per prompt
 
 
 ###############################################################################
@@ -79,7 +80,7 @@ def send_batch_request(endpoint, prompts, gen_tokens, request_id):
         "temperature": 0.7,
         "stop": "\n",
     }
-    data = {"text": prompts, "sampling_params": sampling_params}
+    data = {"text": prompts, "sampling_params": sampling_params, "no_prefix_match": True}
 
     start_time = time.perf_counter()
     try:
@@ -174,7 +175,7 @@ def main():
     )
 
     # Flush cache before benchmark
-    # endpoint.flush_cache()
+    endpoint.flush_cache()
 
     # Run benchmark
     print(
