@@ -372,6 +372,17 @@ class NativeSparseAttnBackend(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
             )
 
+            # Pre-allocate kv_indices buffer for CUDA graph compatibility
+            # Max size is max_bs * max_context_len
+            max_kv_indices_size = max_bs * self.max_context_len
+            self.kv_indices_buffer = torch.zeros(
+                max_kv_indices_size, dtype=torch.int32, device=model_runner.device
+            )
+            # Pre-allocate sort key buffer for compaction
+            self.sort_key_buffer = torch.zeros(
+                max_kv_indices_size, dtype=torch.int64, device=model_runner.device
+            )
+
         # Speculative decoding
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
@@ -1773,7 +1784,26 @@ class NativeSparseAttnBackend(
         non_minus1_counts = non_minus1_mask.sum(dim=1)
         kv_indptr[1 : bs + 1] = torch.cumsum(non_minus1_counts, dim=0)
 
-        kv_indices = page_table_1[page_table_1 != -1]
+        # CUDA-graph-compatible compaction of valid indices
+        # Boolean indexing (page_table_1[mask]) is not graph-compatible
+        # Use sort-based compaction instead
+        flat_table = page_table_1.view(-1)
+        flat_mask = non_minus1_mask.view(-1)
+        numel = flat_table.numel()
+
+        # Create sort key: valid elements (mask=True) get key = position,
+        # invalid elements get key = numel + position (so they sort after valid ones)
+        pos_indices = torch.arange(numel, device=flat_table.device, dtype=torch.int64)
+        sort_key = self.sort_key_buffer[:numel]
+        sort_key.copy_(torch.where(flat_mask, pos_indices, numel + pos_indices))
+
+        # Sort to get indices that put valid elements first (in original order)
+        _, sorted_indices = torch.sort(sort_key)
+
+        # Gather values in sorted order and store in pre-allocated buffer
+        total_valid = kv_indptr[bs]
+        self.kv_indices_buffer[:numel] = flat_table[sorted_indices]
+        kv_indices = self.kv_indices_buffer[:total_valid]
 
         mla_decode_fwd(
             q.view(-1, layer.tp_q_head_num, layer.head_dim),
