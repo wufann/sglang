@@ -419,31 +419,6 @@ class Indexer(MultiPlatformOp):
         block_tables_min = block_tables.min().item()
         _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, block_tables max={block_tables_max}, min={block_tables_min}")
         
-        # Dump inputs for debugging (only once per batch_size, on TP0, layer_id=0)
-        import os
-        import torch.distributed as dist
-        dump_enabled = os.environ.get("DUMP_DEEPGEMM_INPUTS", "0") == "1"
-        is_tp0 = not dist.is_initialized() or dist.get_rank() == 0
-        if dump_enabled and is_tp0 and layer_id == 0:
-            dump_dir = "/sgl-workspace/deepgemm_dump"
-            os.makedirs(dump_dir, exist_ok=True)
-            dump_file = f"{dump_dir}/inputs_bs{batch_size}.pt"
-            if not os.path.exists(dump_file):
-                _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] DUMPING inputs to {dump_file}")
-                torch.save({
-                    "q_fp8": q_fp8.cpu(),
-                    "kv_cache_fp8": kv_cache_fp8.cpu(),
-                    "weights": weights.cpu(),
-                    "seqlens_32": seqlens_32.cpu(),
-                    "block_tables": block_tables.cpu(),
-                    "max_seq_len": max_seq_len,
-                    "block_kv": block_kv,
-                    "batch_size": batch_size,
-                    "next_n": next_n,
-                    "heads": heads,
-                }, dump_file)
-                _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] DUMP completed!")
-        
         # Validate block_tables - all zeros is suspicious for decode
         if block_tables_max == 0 and block_tables_min == 0:
             _v32_log_warning(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, WARNING: block_tables is all zeros! This is likely a bug.")
