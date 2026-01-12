@@ -1713,7 +1713,7 @@ class NativeSparseAttnBackend(
         # Use sort-based compaction instead
         flat_table = page_table_1.view(-1)
         flat_mask = non_minus1_mask.view(-1)
-        numel = flat_table.numel()
+        numel = flat_table.numel()  # Python int, safe for graph
 
         # Create sort key: valid elements (mask=True) get key = position,
         # invalid elements get key = numel + position (so they sort after valid ones)
@@ -1725,9 +1725,9 @@ class NativeSparseAttnBackend(
         _, sorted_indices = torch.sort(sort_key)
 
         # Gather values in sorted order and store in pre-allocated buffer
-        total_valid = kv_indptr[bs]
+        # Use fixed-size slice (numel is Python int) - kernel uses kv_indptr for actual valid range
         self.kv_indices_buffer[:numel] = flat_table[sorted_indices]
-        kv_indices = self.kv_indices_buffer[:total_valid]
+        kv_indices = self.kv_indices_buffer[:numel]
 
         mla_decode_fwd(
             q.view(-1, layer.tp_q_head_num, layer.head_dim),
