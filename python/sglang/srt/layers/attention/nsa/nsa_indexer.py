@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
-import logging
 
 import torch
 from einops import rearrange
@@ -10,27 +9,6 @@ from einops import rearrange
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
-
-# V3.2 DEBUG LOGGING
-_v32_debug_logger = logging.getLogger("V32_DEBUG")
-
-def _v32_log_debug(layer_id: int, msg: str):
-    """Only log on TP0 and layer_id=0 to reduce log spam"""
-    import torch.distributed as dist
-    if dist.is_initialized() and dist.get_rank() != 0:
-        return
-    if layer_id != 0:
-        return
-    _v32_debug_logger.debug(msg)
-
-def _v32_log_warning(layer_id: int, msg: str):
-    """Only log warnings on TP0 and layer_id=0"""
-    import torch.distributed as dist
-    if dist.is_initialized() and dist.get_rank() != 0:
-        return
-    if layer_id != 0:
-        return
-    _v32_debug_logger.warning(msg)
 
 global _use_multi_stream
 
@@ -328,7 +306,6 @@ class Indexer(MultiPlatformOp):
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, ENTER, q_fp8.shape={q_fp8.shape}, weights.shape={weights.shape}")
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
@@ -340,23 +317,12 @@ class Indexer(MultiPlatformOp):
         # NOTE(dark): this support extend/decode/decode+graph
         # block_tables = metadata.get_page_table_64()
         block_tables = metadata.get_page_table_1()
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, block_tables.shape={block_tables.shape}, page_size={page_size}")
 
         # max_seq_len = block_tables.shape[1] * page_size
         max_seq_len = block_tables.shape[1] * 1
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, max_seq_len={max_seq_len}")
-        
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, getting index_k_with_scale_buffer...")
-        try:
-            kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-                layer_id=layer_id
-            )
-            _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, kv_cache_fp8.shape={kv_cache_fp8.shape}, dtype={kv_cache_fp8.dtype}")
-            _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, kv_cache_fp8.is_contiguous={kv_cache_fp8.is_contiguous()}, device={kv_cache_fp8.device}")
-            _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, kv_cache_fp8.data_ptr=0x{kv_cache_fp8.data_ptr():x}")
-        except Exception as e:
-            _v32_log_warning(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, get_index_k_with_scale_buffer FAILED: {e}")
-            raise
+        kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+            layer_id=layer_id
+        )
 
         blocksize = page_size
         if (
@@ -366,7 +332,6 @@ class Indexer(MultiPlatformOp):
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, seqlens_32.shape={seqlens_32.shape}, seqlens_32={seqlens_32[:min(10, len(seqlens_32))].tolist()}")
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
@@ -382,12 +347,10 @@ class Indexer(MultiPlatformOp):
         block_kv = 1
         num_heads_kv = 1
         head_dim_with_sf = 132
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, reshaping kv_cache_fp8 from {kv_cache_fp8.shape} to (-1, {block_kv}, {num_heads_kv}, {head_dim_with_sf})")
         kv_cache_fp8 = kv_cache_fp8.view(
             -1, block_kv, num_heads_kv, head_dim_with_sf
             # kv_cache_fp8.shape[0]*64, block_kv, num_heads_kv, head_dim_with_sf
         )
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, kv_cache_fp8 reshaped to {kv_cache_fp8.shape}")
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
@@ -404,75 +367,30 @@ class Indexer(MultiPlatformOp):
         from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
         batch_size, next_n, heads, _ = q_fp8.shape
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, batch_size={batch_size}, next_n={next_n}, heads={heads}")
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, creating logits tensor with shape ({heads}, {batch_size * next_n}, {max_seq_len})")
         logits = torch.full(
             (heads, batch_size * next_n, max_seq_len),
             float("-inf"),
             device=q_fp8.device,
             dtype=torch.float32,
         )
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, calling deepgemm_fp8_paged_mqa_logits...")
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, q_fp8.shape={q_fp8.shape}, kv_cache_fp8.shape={kv_cache_fp8.shape}, weights.shape={weights.shape}, logits.shape={logits.shape}")
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, block_tables.shape={block_tables.shape}, block_tables.dtype={block_tables.dtype}")
-        block_tables_max = block_tables.max().item()
-        block_tables_min = block_tables.min().item()
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, block_tables max={block_tables_max}, min={block_tables_min}")
-        
-        # Validate block_tables - all zeros is suspicious for decode
-        if block_tables_max == 0 and block_tables_min == 0:
-            _v32_log_warning(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, WARNING: block_tables is all zeros! This is likely a bug.")
-            _v32_log_warning(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, seqlens_32={seqlens_32[:min(10, len(seqlens_32))].tolist()}")
-            _v32_log_warning(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, kv_cache_fp8 max_index_used={kv_cache_fp8.shape[0]}")
-        try:
-            _ = deepgemm_fp8_paged_mqa_logits(
-              q_fp8,
-              kv_cache_fp8,
-              weights,
-              logits,
-              seqlens_32,
-              block_tables,
-              max_seq_len,
-              Preshuffle=False,
-              KVBlockSize=block_kv,
-              ChunkK=128,
-              TotalCuCount=256,
-              WavePerEU=5,
-              VarCtxSchedule=None
-            )
-            _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, deepgemm_fp8_paged_mqa_logits completed successfully")
-        except Exception as e:
-            _v32_log_warning(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, deepgemm_fp8_paged_mqa_logits FAILED: {e}")
-            raise
+        _ = deepgemm_fp8_paged_mqa_logits(
+          q_fp8,
+          kv_cache_fp8,
+          weights,
+          logits,
+          seqlens_32,
+          block_tables,
+          max_seq_len,
+          Preshuffle=False,
+          KVBlockSize=block_kv,
+          ChunkK=128,
+          TotalCuCount=256,
+          WavePerEU=5,
+          VarCtxSchedule=None
+        )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, logits before sum: shape={logits.shape}, dtype={logits.dtype}")
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, logits stats: min={logits.min().item()}, max={logits.max().item()}, has_nan={torch.isnan(logits).any().item()}, has_inf={torch.isinf(logits).any().item()}")
-        
-        # Sync GPU to catch any async errors from previous kernel
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, syncing GPU before logits.sum...")
-        torch.cuda.synchronize()
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, GPU sync completed, computing logits.sum(dim=0)...")
-        
-        try:
-            logits_summed = logits.sum(dim=0)
-            _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, logits_summed.shape={logits_summed.shape}, dtype={logits_summed.dtype}")
-            _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, logits_summed stats: min={logits_summed.min().item()}, max={logits_summed.max().item()}")
-        except Exception as e:
-            _v32_log_warning(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, logits.sum(dim=0) FAILED: {e}")
-            raise
-        
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, syncing GPU before topk_transform...")
-        torch.cuda.synchronize()
-        _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, computing topk_transform with index_topk={self.index_topk}...")
-        try:
-            topk_result = metadata.topk_transform(logits_summed, self.index_topk, layer_id=layer_id)
-            _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, topk_transform completed, syncing...")
-            torch.cuda.synchronize()
-            _v32_log_debug(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, topk_result.shape={topk_result.shape}")
-        except Exception as e:
-            _v32_log_warning(layer_id, f"[Indexer._get_topk_paged] layer_id={layer_id}, topk_transform FAILED: {e}")
-            raise
+        topk_result = metadata.topk_transform(logits.sum(dim=0), self.index_topk)
         return topk_result
 
     def _should_chunk_mqa_logits(
@@ -581,7 +499,7 @@ class Indexer(MultiPlatformOp):
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
-            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks, layer_id=layer_id)
+            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
             topk_result[:q_offset] = raw_topk_result
             return topk_result
 
@@ -649,7 +567,6 @@ class Indexer(MultiPlatformOp):
                 ke_offset=lengths_chunk,
                 batch_idx_list=batch_idx_chunk,
                 topk_indices_offset_override=topk_offset_chunk,
-                layer_id=layer_id,
             )
             topk_result[start:end] = raw_topk_chunk
             start = end
@@ -695,7 +612,7 @@ class Indexer(MultiPlatformOp):
             dtype=torch.float32,
             device=x.device,
         )
-        return metadata.topk_transform(dummy_logits, self.index_topk, layer_id=layer_id)
+        return metadata.topk_transform(dummy_logits, self.index_topk)
 
     def _get_topk_ragged_with_cp(
         self,
@@ -793,7 +710,6 @@ class Indexer(MultiPlatformOp):
                 cu_seqlens_q=actual_seq_q,
                 ke_offset=ke_offset,
                 batch_idx_list=batch_idx_list,
-                layer_id=layer_id,
             )
         else:
             kv_len = (
@@ -841,7 +757,6 @@ class Indexer(MultiPlatformOp):
                 ks=ks,
                 cu_seqlens_q=actual_seq_q,
                 ke_offset=ke_offset,
-                layer_id=layer_id,
             )
 
         return topk_result
@@ -938,7 +853,6 @@ class Indexer(MultiPlatformOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, x.shape={x.shape}, q_lora.shape={q_lora.shape}, positions.shape={positions.shape}, forward_mode={forward_batch.forward_mode}")
         if is_hip():
             from sglang.srt.layers.attention.nsa.tilelang_kernel import act_quant
         elif not is_npu():
@@ -947,11 +861,9 @@ class Indexer(MultiPlatformOp):
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
-        _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, getting indexer metadata...")
         metadata = forward_batch.attn_backend.get_indexer_metadata(
             layer_id, forward_batch
         )
-        _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, metadata type={type(metadata)}, is_none={metadata is None}")
 
         enable_dual_stream = (
             NSA_DUAL_STREAM
@@ -963,7 +875,6 @@ class Indexer(MultiPlatformOp):
 
         # skip NSA if attention backend choose to skip this batch
         if metadata is None:
-            _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, metadata is None, skipping")
             return None
 
         # Determine if should skip topk based on sequence length
@@ -973,11 +884,9 @@ class Indexer(MultiPlatformOp):
             if forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
-                _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, max_kv_len={max_kv_len}, index_topk={self.index_topk}, skip_logits={skip_logits_computation}")
 
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.nsa_enable_prefill_cp):
-            _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, taking fast path _forward_cuda_k_only")
             return self._forward_cuda_k_only(
                 x,
                 positions,
@@ -989,67 +898,45 @@ class Indexer(MultiPlatformOp):
                 return_indices,
             )
 
-        _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, calling _get_q_k_bf16...")
-        try:
-            query, key = self._get_q_k_bf16(
-                q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
-            )
-            _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, query.shape={query.shape}, key.shape={key.shape}")
-        except Exception as e:
-            _v32_log_warning(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, _get_q_k_bf16 FAILED: {e}")
-            raise
+        query, key = self._get_q_k_bf16(
+            q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
+        )
 
-        _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, quantizing Q and K to FP8...")
-        try:
-            if enable_dual_stream:
-                current_stream = torch.cuda.current_stream()
-                self.alt_stream.wait_stream(current_stream)
+        if enable_dual_stream:
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
 
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                with torch.cuda.stream(self.alt_stream):
-                    k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
-                current_stream.wait_stream(self.alt_stream)
-            else:
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            with torch.cuda.stream(self.alt_stream):
                 k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
-            _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, q_fp8.shape={q_fp8.shape}, k_fp8.shape={k_fp8.shape}")
-        except Exception as e:
-            _v32_log_warning(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, act_quant FAILED: {e}")
-            raise
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
         # k_fp8: (seq_len, head_dim) fp8_e4m3fn
         # k_buffer: (num_total_tokens + page_size, head_dim) fp8_e4m3fn
         # k_scale: (seq_len, head_dim // block_size = 1) fp8_e4m3fn
         # k_scale_cache: (num_total_tokens + page_size, head_dim // block_size = 1) fp8_e4m3fn
-        _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, setting index_k_scale_buffer, out_cache_loc.shape={forward_batch.out_cache_loc.shape}, k_fp8.shape={k_fp8.shape}, k_scale.shape={k_scale.shape}")
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
-        try:
-            forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
-                layer_id=layer_id,
-                loc=forward_batch.out_cache_loc,
-                index_k=k_fp8,
-                index_k_scale=k_scale,
-            )
-            _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, set_index_k_scale_buffer completed")
-        except Exception as e:
-            _v32_log_warning(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, set_index_k_scale_buffer FAILED: {e}")
-            raise
+        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
+            layer_id=layer_id,
+            loc=forward_batch.out_cache_loc,
+            index_k=k_fp8,
+            index_k_scale=k_scale,
+        )
 
-        _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, getting logits head gate...")
         weights = self._get_logits_head_gate(x, q_scale)
-        _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, weights.shape={weights.shape}")
 
         if is_cuda() or is_hip():
             assert forward_batch.seq_lens_cpu is not None
-            _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, seq_lens_cpu.shape={forward_batch.seq_lens_cpu.shape}, len={len(forward_batch.seq_lens_cpu)}")
             if len(forward_batch.seq_lens_cpu) == 0:
                 # this seems b/c max-pad, no worries?
                 # if x.shape[0] != 0:
                 #     print(
                 #         "HACK: seq_lens empty but x not empty, hackily return all-invalid topk_result"
                 #     )
-                _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, seq_lens empty, returning full -1 topk")
                 return torch.full(
                     (x.shape[0], self.index_topk), -1, dtype=torch.int, device="cuda"
                 )
@@ -1059,21 +946,14 @@ class Indexer(MultiPlatformOp):
                 or forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend(include_v2=True)
             ):
-                _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, calling _get_topk_paged (decode/verify/draft mode)")
-                try:
-                    topk_result = self._get_topk_paged(
-                        forward_batch, layer_id, q_fp8, weights, metadata
-                    )
-                    _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, _get_topk_paged completed, topk_result.shape={topk_result.shape}")
-                except Exception as e:
-                    _v32_log_warning(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, _get_topk_paged FAILED: {e}")
-                    raise
+                topk_result = self._get_topk_paged(
+                    forward_batch, layer_id, q_fp8, weights, metadata
+                )
             else:
                 if (
                     forward_batch.nsa_cp_metadata is not None
                     and is_nsa_prefill_cp_in_seq_split()
                 ):
-                    _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, using CP split path")
                     kv_len_prev = forward_batch.nsa_cp_metadata.kv_len_prev
                     kv_len_next = forward_batch.nsa_cp_metadata.kv_len_next
                     actual_seq_q_prev = forward_batch.nsa_cp_metadata.actual_seq_q_prev
@@ -1110,15 +990,9 @@ class Indexer(MultiPlatformOp):
                     )
                     return torch.cat([topk_result_prev, topk_result_next], dim=0)
                 else:
-                    _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, calling _get_topk_ragged (extend mode)")
-                    try:
-                        topk_result = self._get_topk_ragged(
-                            forward_batch, layer_id, q_fp8, weights, metadata
-                        )
-                        _v32_log_debug(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, _get_topk_ragged completed, topk_result.shape={topk_result.shape}")
-                    except Exception as e:
-                        _v32_log_warning(layer_id, f"[Indexer.forward_cuda] layer_id={layer_id}, _get_topk_ragged FAILED: {e}")
-                        raise
+                    topk_result = self._get_topk_ragged(
+                        forward_batch, layer_id, q_fp8, weights, metadata
+                    )
         else:
             topk_result = self.forward_indexer(
                 q_fp8.contiguous(),

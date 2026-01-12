@@ -3,31 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
-import logging
 
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
-
-# V3.2 DEBUG LOGGING
-_v32_debug_logger = logging.getLogger("V32_DEBUG")
-
-def _v32_log_debug_tp0(msg: str):
-    """Only log on TP0 to reduce log spam"""
-    import torch.distributed as dist
-    if dist.is_initialized() and dist.get_rank() != 0:
-        return
-    _v32_debug_logger.debug(msg)
-
-def _v32_log_debug_tp0_layer0(layer_id: int, msg: str):
-    """Only log on TP0 and layer_id=0 to reduce log spam"""
-    import torch.distributed as dist
-    if dist.is_initialized() and dist.get_rank() != 0:
-        return
-    if layer_id != 0:
-        return
-    _v32_debug_logger.debug(msg)
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
@@ -225,12 +204,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         ke_offset: torch.Tensor = None,
         batch_idx_list: List[int] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
-        layer_id: int = 0,
     ) -> torch.Tensor:
-        _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] ENTER, logits.shape={logits.shape}, topk={topk}, ks={ks}, cu_seqlens_q={cu_seqlens_q}, ke_offset={ke_offset}")
-        _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] logits.dtype={logits.dtype}, logits.device={logits.device}, logits.is_contiguous={logits.is_contiguous()}")
-        _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] logits min={logits.min().item()}, max={logits.max().item()}, has_nan={torch.isnan(logits).any().item()}, has_inf={torch.isinf(logits).any().item()}")
-        
         from sgl_kernel import (
             fast_topk_transform_fused,
             fast_topk_transform_ragged_fused,
@@ -240,7 +214,6 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         if topk_indices_offset_override is not None:
             cu_topk_indices_offset = topk_indices_offset_override
             cu_seqlens_q_topk = None
-            _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] using topk_indices_offset_override")
         elif cu_seqlens_q is not None:
             cu_seqlens_q = cu_seqlens_q.to(torch.int32)
             cu_seqlens_q_topk = compute_cu_seqlens(cu_seqlens_q)
@@ -248,71 +221,38 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
                 cu_seqlens_q_topk[:-1],
                 cu_seqlens_q,
             )
-            _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] computed cu_seqlens_q_topk.shape={cu_seqlens_q_topk.shape}, cu_topk_indices_offset.shape={cu_topk_indices_offset.shape}")
         else:
             cu_seqlens_q_topk = self.attn_metadata.cu_seqlens_q
             cu_topk_indices_offset = self.attn_metadata.topk_indices_offset
-            _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] using attn_metadata: cu_seqlens_q_topk.shape={cu_seqlens_q_topk.shape if cu_seqlens_q_topk is not None else None}, cu_topk_indices_offset.shape={cu_topk_indices_offset.shape if cu_topk_indices_offset is not None else None}")
-        
         if ke_offset is not None:
             seq_lens_topk = ke_offset
         else:
             seq_lens_topk = self.get_seqlens_expanded()
-        _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] seq_lens_topk.shape={seq_lens_topk.shape}, seq_lens_topk[:10]={seq_lens_topk[:min(10, len(seq_lens_topk))].tolist()}")
-        
         if batch_idx_list is not None:
             page_table_size_1 = self.attn_metadata.page_table_1[batch_idx_list]
-            _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] using batch_idx_list, page_table_size_1.shape={page_table_size_1.shape}")
         else:
             page_table_size_1 = self.attn_metadata.page_table_1
-            _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] using full page_table_1, shape={page_table_size_1.shape}")
-        
-        _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] page_table_size_1.dtype={page_table_size_1.dtype}, max={page_table_size_1.max().item()}, min={page_table_size_1.min().item()}")
-        _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] NSA_FUSE_TOPK={NSA_FUSE_TOPK}, topk_transform_method={self.topk_transform_method}")
 
         if not NSA_FUSE_TOPK:
-            _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] calling fast_topk_v2...")
-            try:
-                result = fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
-                _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] fast_topk_v2 completed, result.shape={result.shape}")
-                return result
-            except Exception as e:
-                _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] ERROR: fast_topk_v2 FAILED: {e}")
-                raise
+            return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
         elif self.topk_transform_method == TopkTransformMethod.PAGED:
             # NOTE(dark): if fused, we return a transformed page table directly
-            _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] calling fast_topk_transform_fused (PAGED mode)...")
-            _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] fast_topk_transform_fused args: score.shape={logits.shape}, lengths.shape={seq_lens_topk.shape}, page_table_size_1.shape={page_table_size_1.shape}, cu_seqlens_q={cu_seqlens_q_topk.shape if cu_seqlens_q_topk is not None else None}, topk={topk}, row_starts={ks}")
-            try:
-                result = fast_topk_transform_fused(
-                    score=logits,
-                    lengths=seq_lens_topk,
-                    page_table_size_1=page_table_size_1,
-                    cu_seqlens_q=cu_seqlens_q_topk,
-                    topk=topk,
-                    row_starts=ks,
-                )
-                _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] fast_topk_transform_fused completed, result.shape={result.shape}")
-                return result
-            except Exception as e:
-                _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] ERROR: fast_topk_transform_fused FAILED: {e}")
-                raise
+            return fast_topk_transform_fused(
+                score=logits,
+                lengths=seq_lens_topk,
+                page_table_size_1=page_table_size_1,
+                cu_seqlens_q=cu_seqlens_q_topk,
+                topk=topk,
+                row_starts=ks,
+            )
         elif self.topk_transform_method == TopkTransformMethod.RAGGED:
-            _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] calling fast_topk_transform_ragged_fused (RAGGED mode)...")
-            _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] fast_topk_transform_ragged_fused args: score.shape={logits.shape}, lengths.shape={seq_lens_topk.shape}, topk_indices_offset.shape={cu_topk_indices_offset.shape if cu_topk_indices_offset is not None else None}, topk={topk}, row_starts={ks}")
-            try:
-                result = fast_topk_transform_ragged_fused(
-                    score=logits,
-                    lengths=seq_lens_topk,
-                    topk_indices_offset=cu_topk_indices_offset,
-                    topk=topk,
-                    row_starts=ks,
-                )
-                _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] fast_topk_transform_ragged_fused completed, result.shape={result.shape}")
-                return result
-            except Exception as e:
-                _v32_log_debug_tp0_layer0(layer_id, f"[NSAIndexerMetadata.topk_transform] ERROR: fast_topk_transform_ragged_fused FAILED: {e}")
-                raise
+            return fast_topk_transform_ragged_fused(
+                score=logits,
+                lengths=seq_lens_topk,
+                topk_indices_offset=cu_topk_indices_offset,
+                topk=topk,
+                row_starts=ks,
+            )
         else:
             assert False, f"Unsupported {self.topk_transform_method = }"
 
@@ -340,7 +280,6 @@ class NativeSparseAttnBackend(
             1 if model_runner.server_args.enable_deterministic_inference else 0
         )
         self.use_nsa = is_deepseek_nsa(model_runner.model_config.hf_config)
-        _v32_log_debug_tp0(f"[NSABackend.__init__] use_nsa={self.use_nsa}")
         assert self.use_nsa, "NSA backend only supports DeepSeek NSA"
         self.nsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
@@ -351,7 +290,6 @@ class NativeSparseAttnBackend(
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
         self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
-        _v32_log_debug_tp0(f"[NSABackend.__init__] nsa_kv_cache_store_fp8={self.nsa_kv_cache_store_fp8}, nsa_index_topk={self.nsa_index_topk}, max_context_len={self.max_context_len}, num_q_heads={self.num_q_heads}, kv_cache_dim={self.kv_cache_dim}")
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -427,11 +365,8 @@ class NativeSparseAttnBackend(
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
-        import sys
-        print(f"[NSABackend.init_forward_metadata] CALLED - batch_size={forward_batch.batch_size}, forward_mode={forward_batch.forward_mode}", file=sys.stderr, flush=True)
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
-        _v32_log_debug_tp0(f"[NSABackend.init_forward_metadata] batch_size={batch_size}, forward_mode={forward_batch.forward_mode}")
 
         if forward_batch.forward_mode.is_target_verify():
             draft_token_num = self.speculative_num_draft_tokens
@@ -442,18 +377,10 @@ class NativeSparseAttnBackend(
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
         assert forward_batch.seq_lens_cpu is not None
         max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item() + draft_token_num)
-        _v32_log_debug_tp0(f"[NSABackend.init_forward_metadata] max_seqlen_k={max_seqlen_k}, seq_lens_cpu[:10]={forward_batch.seq_lens_cpu[:min(10, len(forward_batch.seq_lens_cpu))].tolist()}")
         # [b, max_seqlen_k]
-        _v32_log_debug_tp0(f"[NSABackend.init_forward_metadata] req_to_token_pool.req_to_token.shape={forward_batch.req_to_token_pool.req_to_token.shape}")
-        _v32_log_debug_tp0(f"[NSABackend.init_forward_metadata] req_pool_indices.shape={forward_batch.req_pool_indices.shape}, req_pool_indices[:10]={forward_batch.req_pool_indices[:min(10, len(forward_batch.req_pool_indices))].tolist()}")
         page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
         ]
-        _v32_log_debug_tp0(f"[NSABackend.init_forward_metadata] page_table.shape={page_table.shape}, page_table.dtype={page_table.dtype}")
-        _v32_log_debug_tp0(f"[NSABackend.init_forward_metadata] page_table max={page_table.max().item()}, min={page_table.min().item()}")
-        # Check if first few entries are correct
-        if page_table.numel() > 0 and max_seqlen_k > 0:
-            _v32_log_debug_tp0(f"[NSABackend.init_forward_metadata] page_table[0, :10]={page_table[0, :min(10, max_seqlen_k)].tolist()}")
 
         page_table_1_flattened = None
         topk_indices_offset = None
@@ -1024,7 +951,6 @@ class NativeSparseAttnBackend(
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = int(seq_lens_cpu.max().item())
-            _v32_log_debug_tp0(f"[NSABackend.init_cudagraph_metadata] decode mode, bs={bs}, max_len={max_len}")
 
             cache_seqlens = seq_lens.to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
@@ -1032,8 +958,6 @@ class NativeSparseAttnBackend(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
             page_indices = self.req_to_token[req_pool_indices, :max_len]
-            _v32_log_debug_tp0(f"[NSABackend.init_cudagraph_metadata] page_indices.shape={page_indices.shape}, max={page_indices.max().item()}, min={page_indices.min().item()}")
-            _v32_log_debug_tp0(f"[NSABackend.init_cudagraph_metadata] metadata.page_table_1.shape={metadata.page_table_1.shape}, copy to [:, :{max_len}]")
             metadata.page_table_1[:, :max_len].copy_(page_indices)
             nsa_cache_seqlens = compute_nsa_seqlens(
                 cache_seqlens, nsa_index_topk=self.nsa_index_topk

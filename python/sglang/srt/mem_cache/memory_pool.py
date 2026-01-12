@@ -48,18 +48,6 @@ import triton
 import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-
-# V3.2 DEBUG LOGGING
-_v32_debug_logger = logging.getLogger("V32_DEBUG")
-
-def _v32_log_debug_layer0(layer_id: int, msg: str):
-    """Only log on TP0 and layer_id=0 to reduce log spam"""
-    import torch.distributed as dist
-    if dist.is_initialized() and dist.get_rank() != 0:
-        return
-    if layer_id != 0:
-        return
-    _v32_debug_logger.debug(msg)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
@@ -1978,17 +1966,10 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        _v32_log_debug_layer0(layer_id, f"[NSATokenToKVPool.set_index_k_scale_buffer] layer_id={layer_id}, loc.shape={loc.shape}, loc.max={loc.max().item()}, loc.min={loc.min().item()}, index_k.shape={index_k.shape}, index_k_scale.shape={index_k_scale.shape}")
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-        _v32_log_debug_layer0(layer_id, f"[NSATokenToKVPool.set_index_k_scale_buffer] layer_id={layer_id}, buf.shape={buf.shape}, buf.dtype={buf.dtype}")
-        try:
-            index_buf_accessor.SetKAndS.execute(
-                pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
-            )
-            _v32_log_debug_layer0(layer_id, f"[NSATokenToKVPool.set_index_k_scale_buffer] layer_id={layer_id}, SetKAndS completed successfully")
-        except Exception as e:
-            _v32_log_debug_layer0(layer_id, f"[NSATokenToKVPool.set_index_k_scale_buffer] layer_id={layer_id}, SetKAndS FAILED: {e}")
-            raise
+        index_buf_accessor.SetKAndS.execute(
+            pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
+        )
 
     def get_state_buf_infos(self):
         data_ptrs = [
