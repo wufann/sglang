@@ -368,7 +368,7 @@ class Indexer(MultiPlatformOp):
 
         batch_size, next_n, heads, _ = q_fp8.shape
         logits = torch.full(
-            (heads, batch_size * next_n, max_seq_len),
+            (batch_size * next_n, max_seq_len),
             float("-inf"),
             device=q_fp8.device,
             dtype=torch.float32,
@@ -390,7 +390,7 @@ class Indexer(MultiPlatformOp):
         )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        topk_result = metadata.topk_transform(logits.sum(dim=0), self.index_topk)
+        topk_result = metadata.topk_transform(logits, self.index_topk)
         return topk_result
 
     def _should_chunk_mqa_logits(
