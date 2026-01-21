@@ -568,9 +568,9 @@ class Indexer(MultiPlatformOp):
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
-                    logits = fp8_mqa_logits(
+                    logits_chunk = fp8_mqa_logits(
                         q_fp8[start:end],
-                        kv_fp8,
+                        kv,
                         scale,
                         weights[start:end],
                         ks[start:end],
