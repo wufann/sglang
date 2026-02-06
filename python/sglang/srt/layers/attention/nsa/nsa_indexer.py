@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextlib
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
-
+import numpy as np
 import torch
 from einops import rearrange
 
@@ -48,7 +48,10 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
-
+def print_rank0(*args, **kwargs):
+    import torch.distributed as dist
+    if dist.get_rank() == 0:
+        print(*args, **kwargs, flush=True)
 
 class BaseIndexerMetadata(ABC):
     @abstractmethod
@@ -428,7 +431,24 @@ class Indexer(MultiPlatformOp):
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        if _is_hip:
+            from aiter import top_k_per_row_decode  # fast?
+            # num_rows = logits.shape[0] 
+            num_rows = batch_size * next_n
+            topk_result = torch.full((num_rows, self.index_topk), -1, dtype=torch.int32, device=logits.device)
+            top_k_per_row_decode(
+                logits,
+                next_n,
+                seqlens_32,
+                topk_result,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+            )
+            for i in range(num_rows):
+                topk_result[i] = block_tables[i, topk_result[i]]
+        else:
+            topk_result = metadata.topk_transform(logits, self.index_topk)
         return topk_result
 
     def _should_chunk_mqa_logits(
@@ -542,8 +562,51 @@ class Indexer(MultiPlatformOp):
                     )
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
+            # if _is_hip:
+            if 0:
+                from aiter import top_k_per_row_prefill
+                num_rows = logits.shape[0]
+                raw_topk_result = torch.full(
+                    (num_rows, self.index_topk), 
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                top_k_per_row_prefill(
+                    logits,
+                    ks,
+                    ke,
+                    raw_topk_result,
+                    None,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                )
+                # if layer_id == 0:
+                #     print_rank0(f"raw_topk_result kernel output : {raw_topk_result}")
+                #     torch.save(raw_topk_result.cpu(), "raw_topk_result.pt")
+                #     torch.save(ks.cpu(), "ks.pt")
+                #     torch.save(ke.cpu(), "ke.pt")
+                #     torch.save(logits.cpu(), "logits.pt")
+                #     # np.savetxt("raw_topk_result_aiter.txt",raw_topk_result.cpu().numpy(),fmt="%d")
 
-            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
+                for i in range(num_rows):
+                    # start = cu_seqlens_q_topk[i].item()
+                    # end   = cu_seqlens_q_topk[i + 1].item()
+                    # raw_topk_result[start:end, :] = block_tables[i, raw_topk_result[start:end,:]]
+                    raw_topk_result[i] = block_tables[token_to_batch_idx[i], raw_topk_result[i]]
+                    # raw_topk_result[i] = torch.where(raw_topk_result[i] >=0, block_tables[token_to_batch_idx[i], raw_topk_result[i]], raw_topk_result[i])
+                    # torch.where(ind >= 0, a[ind], ind)
+                # if layer_id == 0:
+                #     print_rank0(f"raw_topk_result aiter: {raw_topk_result}")
+                #     np.savetxt("raw_topk_result_aiter_page_table.txt",raw_topk_result.cpu().numpy(),fmt="%d")
+                #     print_rank0(f"raw_topk_result aiter: {raw_topk_result.shape}")
+            else:
+                raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
+                # if layer_id == 0:
+                #     print_rank0(f"raw_topk_result sgl : {raw_topk_result}")
+                #     np.savetxt("raw_topk_result_sgl_page_table.txt",raw_topk_result.cpu().numpy(),fmt="%d")
+                #     print_rank0(f"raw_topk_result sgl shape: {raw_topk_result.shape}")
             topk_result[:q_offset] = raw_topk_result
             return topk_result
 
@@ -607,16 +670,40 @@ class Indexer(MultiPlatformOp):
                     B_chunk, dtype=torch.int32, device=device
                 )
                 batch_idx_chunk = token_to_batch_idx[start:end]
+            # if _is_hip:
+            if 0:
+                from aiter import top_k_per_row_prefill
 
-            raw_topk_chunk = metadata.topk_transform(
-                logits_chunk,
-                self.index_topk,
-                ks=ks[start:end],
-                cu_seqlens_q=cu_seqlens_q_chunk,
-                ke_offset=lengths_chunk,
-                batch_idx_list=batch_idx_chunk,
-                topk_indices_offset_override=topk_offset_chunk,
-            )
+                num_rows = logits_chunk.shape[0]
+                raw_topk_chunk = torch.full(
+                    (num_rows, self.index_topk),
+                    -1,
+                    dtype=torch.int32,
+                    device=logits_chunk.device,
+                )
+                top_k_per_row_prefill(
+                    logits_chunk,
+                    ks[start:end],
+                    ke[start:end],
+                    raw_topk_chunk,
+                    None,
+                    num_rows,
+                    logits_chunk.stride(0),
+                    logits_chunk.stride(1),
+                )
+                for i in range(num_rows):
+                    raw_topk_chunk[i] = block_tables[batch_idx_chunk[i], raw_topk_chunk[i]]
+            else:
+                raw_topk_chunk = metadata.topk_transform(
+                    logits_chunk,
+                    self.index_topk,
+                    ks=ks[start:end],
+                    cu_seqlens_q=cu_seqlens_q_chunk,
+                    ke_offset=lengths_chunk,
+                    batch_idx_list=batch_idx_chunk,
+                    topk_indices_offset_override=topk_offset_chunk,
+                )
+                print_rank0(f"Need Chunk: raw_topk_chunk shape: {raw_topk_chunk.shape}")
             topk_result[start:end] = raw_topk_chunk
             start = end
 

@@ -1,0 +1,124 @@
+PyTorch version: 2.9.0a0+git7bcbafe
+CUDA available: True
+CUDA device: 
+CUDA capability: (9, 4)
+
+Benchmark configuration:
+  Warmup iterations: 10
+  Benchmark iterations: 100
+  Batch sizes: [4, 8, 16, 24]
+  Sequence lengths: [8, 128, 1024, 3072, 4096, 8192, 16384, 32768, 65536, 90000, 128000]
+  Top-k: 2048
+
+====================================================================================================
+Benchmarking fast_topk_transform_fused (decode mode)...
+====================================================================================================
+Running: bs=4, seq_len=8, mode=decode
+Running: bs=4, seq_len=128, mode=decode
+Running: bs=4, seq_len=1024, mode=decode
+Running: bs=4, seq_len=3072, mode=decode
+Running: bs=4, seq_len=4096, mode=decode
+Running: bs=4, seq_len=8192, mode=decode
+Running: bs=4, seq_len=16384, mode=decode
+Running: bs=4, seq_len=32768, mode=decode
+Running: bs=4, seq_len=65536, mode=decode
+Running: bs=4, seq_len=90000, mode=decode
+Running: bs=4, seq_len=128000, mode=decode
+Running: bs=8, seq_len=8, mode=decode
+Running: bs=8, seq_len=128, mode=decode
+Running: bs=8, seq_len=1024, mode=decode
+Running: bs=8, seq_len=3072, mode=decode
+Running: bs=8, seq_len=4096, mode=decode
+Running: bs=8, seq_len=8192, mode=decode
+Running: bs=8, seq_len=16384, mode=decode
+Running: bs=8, seq_len=32768, mode=decode
+Running: bs=8, seq_len=65536, mode=decode
+Running: bs=8, seq_len=90000, mode=decode
+Running: bs=8, seq_len=128000, mode=decode
+Running: bs=16, seq_len=8, mode=decode
+Running: bs=16, seq_len=128, mode=decode
+Running: bs=16, seq_len=1024, mode=decode
+Running: bs=16, seq_len=3072, mode=decode
+Running: bs=16, seq_len=4096, mode=decode
+Running: bs=16, seq_len=8192, mode=decode
+Running: bs=16, seq_len=16384, mode=decode
+Running: bs=16, seq_len=32768, mode=decode
+Running: bs=16, seq_len=65536, mode=decode
+Running: bs=16, seq_len=90000, mode=decode
+Running: bs=16, seq_len=128000, mode=decode
+Running: bs=24, seq_len=8, mode=decode
+Running: bs=24, seq_len=128, mode=decode
+Running: bs=24, seq_len=1024, mode=decode
+Running: bs=24, seq_len=3072, mode=decode
+Running: bs=24, seq_len=4096, mode=decode
+Running: bs=24, seq_len=8192, mode=decode
+Running: bs=24, seq_len=16384, mode=decode
+Running: bs=24, seq_len=32768, mode=decode
+Running: bs=24, seq_len=65536, mode=decode
+Running: bs=24, seq_len=90000, mode=decode
+Running: bs=24, seq_len=128000, mode=decode
+
+====================================================================================================
+BENCHMARK RESULTS
+
+====================================================================================================
+Kernel: fast_topk_transform_fused
+====================================================================================================
+BS       ActualBS   SeqLen     Mode            Time(ms)     Std(ms)      Throughput(M tok/s) 
+----------------------------------------------------------------------------------------------------
+4        4          8          decode          0.022        0.015        1.47                
+4        4          128        decode          0.020        0.005        25.82               
+4        4          1024       decode          0.019        0.001        213.45              
+4        4          3072       decode          0.019        0.001        646.47              
+4        4          4096       decode          0.019        0.004        859.47              
+4        4          8192       decode          0.022        0.004        1471.12             
+4        4          16384      decode          0.027        0.001        2415.78             
+4        4          32768      decode          0.036        0.004        3612.20             
+4        4          65536      decode          0.052        0.001        5068.91             
+4        4          90000      decode          0.065        0.004        5574.82             
+4        4          128000     decode          0.080        0.004        6392.10             
+8        8          8          decode          0.018        0.001        3.48                
+8        8          128        decode          0.019        0.004        54.97               
+8        8          1024       decode          0.019        0.004        436.17              
+8        8          3072       decode          0.019        0.001        1299.16             
+8        8          4096       decode          0.019        0.004        1695.55             
+8        8          8192       decode          0.023        0.004        2903.99             
+8        8          16384      decode          0.028        0.001        4614.81             
+8        8          32768      decode          0.037        0.004        7155.78             
+8        8          65536      decode          0.053        0.004        9979.46             
+8        8          90000      decode          0.065        0.001        11160.81            
+8        8          128000     decode          0.080        0.004        12741.54            
+16       16         8          decode          0.019        0.004        6.84                
+16       16         128        decode          0.018        0.001        111.95              
+16       16         1024       decode          0.018        0.001        893.82              
+16       16         3072       decode          0.019        0.001        2574.31             
+16       16         4096       decode          0.019        0.001        3438.96             
+16       16         8192       decode          0.022        0.001        5850.49             
+16       16         16384      decode          0.028        0.001        9211.55             
+16       16         32768      decode          0.036        0.001        14533.93            
+16       16         65536      decode          0.053        0.001        19648.56            
+16       16         90000      decode          0.065        0.001        22225.75            
+16       16         128000     decode          0.080        0.001        25530.60            
+24       24         8          decode          0.018        0.001        10.39               
+24       24         128        decode          0.018        0.001        168.60              
+24       24         1024       decode          0.018        0.001        1345.88             
+24       24         3072       decode          0.019        0.001        3856.04             
+24       24         4096       decode          0.019        0.001        5139.77             
+24       24         8192       decode          0.023        0.001        8735.69             
+24       24         16384      decode          0.029        0.001        13718.07            
+24       24         32768      decode          0.036        0.001        21675.12            
+24       24         65536      decode          0.053        0.001        29555.67            
+24       24         90000      decode          0.065        0.001        33293.87            
+24       24         128000     decode          0.080        0.001        38260.66            
+
+====================================================================================================
+SUMMARY
+====================================================================================================
+
+fast_topk_transform_fused:
+  Min time: 0.018 ms
+  Max time: 0.080 ms
+  Avg time: 0.034 ms
+  Min throughput: 1.47 M tokens/s
+  Max throughput: 38260.66 M tokens/s
+  Avg throughput: 7684.41 M tokens/s

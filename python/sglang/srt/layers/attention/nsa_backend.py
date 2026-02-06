@@ -40,7 +40,10 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
-
+def print_rank0(*args, **kwargs):
+    import torch.distributed as dist
+    if dist.get_rank() == 0:
+        print(*args, **kwargs, flush=True)
 
 _is_hip = is_hip()
 
@@ -234,6 +237,14 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
         elif self.topk_transform_method == TopkTransformMethod.PAGED:
             # NOTE(dark): if fused, we return a transformed page table directly
+            #  print_rank0(f"seq_lens_topk prefill shape: {seq_lens_topk.shape}")
+            #  print_rank0(f"seq_lens_topk prefill : {seq_lens_topk}")
+            #  print_rank0(f"page_table_size_1 prefill shape: {page_table_size_1.shape}")
+            #  print_rank0(f"page_table_size_1 prefill: {page_table_size_1}")
+            #  print_rank0(f"cu_seqlens_q_topk prefill shape: {cu_seqlens_q_topk.shape}")
+            #  print_rank0(f"cu_seqlens_q_topk prefill: {cu_seqlens_q_topk}")
+            #  # print_rank0(f"ks prefill shape: {ks.shape}")
+            #  print_rank0(f"ks prefill: {ks}")
             return fast_topk_transform_fused(
                 score=logits,
                 lengths=seq_lens_topk,
