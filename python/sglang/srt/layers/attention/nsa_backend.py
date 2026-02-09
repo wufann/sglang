@@ -5,6 +5,8 @@ from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.environ import envs
@@ -41,7 +43,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
-
+def print_rank0(*args, **kwargs):
+    import torch.distributed as dist
+    if dist.get_rank() == 0:
+        print(*args, **kwargs, flush=True)
 _is_hip = is_hip()
 
 if _is_hip:
@@ -62,6 +67,68 @@ else:
 
 # Reuse this workspace buffer across all NSA backend instances
 global_workspace_buffer = None
+
+
+@triton.jit
+def _compact_kv_indices_kernel(
+    page_table_ptr,  # [bs, topk]
+    kv_indptr_ptr,  # [bs + 1]
+    kv_indices_ptr,  # [bs * topk] output buffer
+    bs: tl.constexpr,
+    topk: tl.constexpr,
+):
+    """
+    Compact valid indices (non -1) from page_table into kv_indices.
+    Each program handles one batch.
+    """
+    batch_id = tl.program_id(0)
+
+    # Get the start position for this batch in kv_indices
+    dst_start = tl.load(kv_indptr_ptr + batch_id)
+
+    # Load all topk indices for this batch
+    src_offset = batch_id * topk
+    offsets = tl.arange(0, topk)
+    indices = tl.load(page_table_ptr + src_offset + offsets)
+
+    # Count valid indices and compact them
+    mask = indices != -1
+    valid_count = tl.sum(mask.to(tl.int32))
+
+    # Use prefix sum to compute destination positions for valid elements
+    # For each position, count how many valid elements are before it
+    prefix_sum = tl.cumsum(mask.to(tl.int32), axis=0) - 1
+
+    # Store valid indices to their compacted positions
+    dst_positions = dst_start + prefix_sum
+    tl.store(kv_indices_ptr + dst_positions, indices, mask=mask)
+
+
+def compact_kv_indices(
+    page_table_1: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    bs: int,
+):
+    """
+    Compact valid indices from page_table_1 into kv_indices buffer.
+    CUDA graph compatible version - uses pre-allocated kv_indices buffer.
+
+    Args:
+        page_table_1: [bs, topk] page table with -1 as invalid
+        kv_indptr: [bs + 1] cumulative count of valid indices per batch
+        kv_indices: [bs * topk] pre-allocated output buffer
+        bs: batch size
+    """
+    topk = page_table_1.shape[1]
+    grid = (bs,)
+    _compact_kv_indices_kernel[grid](
+        page_table_1,
+        kv_indptr,
+        kv_indices,
+        bs,
+        topk,
+    )
 
 
 @dataclass(frozen=True)
@@ -310,9 +377,21 @@ class NativeSparseAttnBackend(
 
         if _is_hip:
             max_bs = model_runner.req_to_token_pool.size
+            print_rank0(f"max_bs:  {max_bs}")
 
             self.kv_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+            )
+
+            self.kv_indices = torch.zeros(
+                max_bs * self.nsa_index_topk,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.kv_indices_prefill = torch.zeros(
+                max_bs * self.nsa_index_topk,
+                dtype=torch.int32,
+                device=self.device,
             )
 
         # Speculative decoding
@@ -763,6 +842,12 @@ class NativeSparseAttnBackend(
                 if self.nsa_decode_impl == "flashmla_kv"
                 else None
             ),
+            # Pre-allocated buffer for kv_indices used by aiter decode (CUDA graph compatible)
+            # "kv_indices": torch.zeros(
+            #     max_bs * self.nsa_index_topk,
+            #     dtype=torch.int32,
+            #     device=self.device,
+            # ),
         }
 
     def init_forward_metadata_capture_cuda_graph(
@@ -1357,6 +1442,17 @@ class NativeSparseAttnBackend(
                 sm_scale=layer.scaling,
                 seq_lens=metadata.nsa_cache_seqlens_int32,
             )
+        elif nsa_impl == "aiter":
+            if q_rope is not None:
+                q_all = torch.cat([q_nope, q_rope], dim=-1)
+            return self._forward_aiter_prefill(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                layer=layer,
+                forward_batch=forward_batch,
+                metadata=metadata,
+            )
         else:
             raise ValueError(f"Unsupported {nsa_impl = }")
 
@@ -1731,8 +1827,8 @@ class NativeSparseAttnBackend(
         non_minus1_counts = non_minus1_mask.sum(dim=1)
         kv_indptr[1 : bs + 1] = torch.cumsum(non_minus1_counts, dim=0)
 
-        kv_indices = page_table_1[page_table_1 != -1]
-
+        kv_indices = self.kv_indices
+        compact_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
         mla_decode_fwd(
             q.view(-1, layer.tp_q_head_num, layer.head_dim),
             kv_cache.view(-1, 1, 1, layer.head_dim),
@@ -1746,6 +1842,73 @@ class NativeSparseAttnBackend(
             layer.logit_cap,
         )
         # kv_cache = kv_cache.view(-1, 1, layer.head_dim)
+        return o
+
+    def _forward_aiter_prefill(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        metadata: NSAMetadata,
+    ) -> torch.Tensor:
+        """Forward using aiter MLA kernel for prefill on AMD ROCm.
+        
+        In prefill, page_table_1 has shape (num_tokens, topk), where num_tokens
+        is the concatenation of multiple batches. The values in page_table_1 are
+        already GLOBAL kv cache indices (transformed by transform_index_page_table_prefill).
+        
+        We just need to:
+        1. Count valid indices per token (non -1)
+        2. Compact valid indices into kv_indices
+        3. Call mla_decode_fwd with per-token attention (each token attends to its topk)
+        """
+        num_tokens = q_all.shape[0]
+        q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
+
+        if layer.head_dim != layer.v_head_dim:
+            o = q.new_empty((num_tokens, layer.tp_q_head_num * layer.v_head_dim))
+        else:
+            o = torch.empty_like(q)
+
+        # page_table_1 already contains GLOBAL kv cache indices (already transformed)
+        # We just need to compact valid indices (non -1) for each token
+        
+        # Count valid indices per token
+        non_minus1_mask = page_table_1 != -1
+        non_minus1_counts = non_minus1_mask.sum(dim=1)
+        
+        # Build kv_indptr for all tokens: [num_tokens + 1]
+        kv_indptr = torch.zeros(num_tokens + 1, dtype=torch.int32, device=self.device)
+        kv_indptr[1:] = torch.cumsum(non_minus1_counts, dim=0)
+        
+        # Compact valid global indices
+        total_valid = kv_indptr[-1].item()
+        kv_indices = torch.zeros(total_valid, dtype=torch.int32, device=self.device)
+        
+        # Use compact_kv_indices kernel to extract valid indices
+        # This kernel works for both decode (bs rows) and prefill (num_tokens rows)
+        if num_tokens > 0 and total_valid > 0:
+            compact_kv_indices(page_table_1, kv_indptr, kv_indices, num_tokens)
+
+        # Build cu_seqlens_q for prefill: each token is treated as seq_len_q=1
+        cu_seqlens_q = torch.arange(
+            0, num_tokens + 1, dtype=torch.int32, device=self.device
+        )
+
+        mla_decode_fwd(
+            q.view(-1, layer.tp_q_head_num, layer.head_dim),
+            kv_cache.view(-1, 1, 1, layer.head_dim),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            cu_seqlens_q,
+            kv_indptr,
+            kv_indices,
+            cu_seqlens_q,
+            1,  # max_seq_len_q = 1 for per-token attention
+            layer.scaling,
+            layer.logit_cap,
+        )
         return o
 
     def _forward_trtllm(
