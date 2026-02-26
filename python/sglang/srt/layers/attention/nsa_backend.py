@@ -1888,8 +1888,8 @@ class NativeSparseAttnBackend(
             kv_indices,
             metadata.cu_seqlens_q,
             metadata.max_seq_len_q,
-            layer.scaling,
-            layer.logit_cap,
+            sm_scale=layer.scaling,
+            logit_cap=layer.logit_cap,
         )
         # kv_cache = kv_cache.view(-1, 1, layer.head_dim)
         return o
@@ -1938,8 +1938,8 @@ class NativeSparseAttnBackend(
             kv_indices,
             cu_seqlens_q,
             1,  # max_seq_len_q = 1 for per-token attention
-            layer.scaling,
-            layer.logit_cap,
+            sm_scale=layer.scaling,
+            logit_cap=layer.logit_cap,
         )
         return o
 
