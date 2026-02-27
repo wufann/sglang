@@ -1494,7 +1494,9 @@ class NativeSparseAttnBackend(
                 layer=layer,
             )
         else:
-            raise ValueError(f"Unsupported {nsa_impl = }")
+            raise ValueError(
+                f"Unsupported {nsa_impl = } for forward_extend. Consider using an other attention backend."
+            )
 
     def forward_decode(
         self,
