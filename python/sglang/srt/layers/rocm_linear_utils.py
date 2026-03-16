@@ -37,7 +37,7 @@ def aiter_dsv3_router_gemm(
 def get_dsv3_gemm_output_zero_allocator_size(
     n_routed_experts: int, num_moe_layers: int, allocate_size: int, embedding_dim: int
 ):
-    if embedding_dim != 7168 or n_routed_experts != 256:
+    if embedding_dim not in (7168, 6144) or n_routed_experts != 256:
         return 0
 
     per_layer_size = 256 * (allocate_size + n_routed_experts)
