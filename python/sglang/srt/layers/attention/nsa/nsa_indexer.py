@@ -421,9 +421,21 @@ class Indexer(MultiPlatformOp):
         # and it is necessary to extract the actual q length.
         q_offset = sum(metadata.get_nsa_extend_len_cpu())
         if _is_hip:
-            from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+            from aiter.ops.triton.pa_mqa_logits import (
+                deepgemm_fp8_paged_mqa_logits,
+                deepgemm_fp8_paged_mqa_logits_schedule,
+            )
 
             batch_size, next_n, heads, _ = q_fp8.shape
+            # safe_chunks_per_cta = deepgemm_fp8_paged_mqa_logits_schedule(
+            #     batch_size,
+            #     next_n,
+            #     seqlens_32,
+            #     max_seq_len,
+            #     ChunkK=256,
+            #     WavePerEU=4,
+            # )
+
             logits = torch.full(
                 (batch_size * next_n, max_seq_len),
                 float("-inf"),
@@ -440,9 +452,10 @@ class Indexer(MultiPlatformOp):
                 max_seq_len,
                 Preshuffle=False,
                 KVBlockSize=block_kv,
-                ChunkK=128,
-                TotalCuCount=256,
-                WavePerEU=5,
+                # ChunkK=128,
+                # TotalCuCount=256,
+                # WavePerEU=5,
+                VarCtxSchedule=safe_chunks_per_cta,
             )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
