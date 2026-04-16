@@ -481,14 +481,19 @@ class MiMoV2Attention(nn.Module):
             partial_rotary_factor=partial_rotary_factor,
         )
 
+        # v_head_dim (128) < head_dim (192): pad V to head_dim so every
+        # attention backend sees head_dim == v_head_dim.  KV cache is also
+        # allocated at head_dim (see model_config._derive_model_shapes).
+        self.pad_v = self.v_head_dim != self.head_dim
+
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            v_head_dim=self.v_head_dim,
-            sliding_window_size=sliding_window_size,  # if is -1 ,normal attention,else ,window attention
+            v_head_dim=self.head_dim if self.pad_v else self.v_head_dim,
+            sliding_window_size=sliding_window_size,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -497,6 +502,18 @@ class MiMoV2Attention(nn.Module):
             torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
             if attention_sink_bias
             else None
+        )
+
+    def _pad_v(self, v: torch.Tensor) -> torch.Tensor:
+        v = v.view(-1, self.num_kv_heads, self.v_head_dim)
+        v = torch.nn.functional.pad(v, [0, self.head_dim - self.v_head_dim])
+        return v.view(-1, self.num_kv_heads * self.head_dim)
+
+    def _slice_attn_output(self, attn_output: torch.Tensor) -> torch.Tensor:
+        return (
+            attn_output.view(-1, self.num_heads, self.head_dim)[
+                ..., : self.v_head_dim
+            ].reshape(-1, self.num_heads * self.v_head_dim)
         )
 
     def op_prepare(self, state):
@@ -525,6 +542,8 @@ class MiMoV2Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         if self.v_scale is not None:
             v = v * self.v_scale
+        if self.pad_v:
+            v = self._pad_v(v)
 
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
@@ -537,6 +556,8 @@ class MiMoV2Attention(nn.Module):
             *inner_state,
             sinks=self.attention_sink_bias,
         )
+        if self.pad_v:
+            attn_output = self._slice_attn_output(attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -555,7 +576,11 @@ class MiMoV2Attention(nn.Module):
 
         if self.v_scale is not None:
             v = v * self.v_scale
+        if self.pad_v:
+            v = self._pad_v(v)
         attn_output = self.attn(q, k, v, forward_batch, sinks=self.attention_sink_bias)
+        if self.pad_v:
+            attn_output = self._slice_attn_output(attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 

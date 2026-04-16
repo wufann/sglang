@@ -445,6 +445,12 @@ class ModelConfig:
             "swa_v_head_dim",
             self.swa_head_dim,
         )
+
+        # MiMoV2Flash pads V to head_dim before attention so that backends
+        # see head_dim == v_head_dim.  KV cache must be allocated accordingly.
+        if getattr(self.hf_text_config, "model_type", None) == "mimo_v2_flash":
+            self.v_head_dim = self.head_dim
+            self.swa_v_head_dim = self.swa_head_dim
         # FIXME: temporary special judge for MLA architecture
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures

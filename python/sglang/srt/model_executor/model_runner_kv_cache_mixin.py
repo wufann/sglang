@@ -298,8 +298,8 @@ class ModelRunnerKVCacheMixin:
                             // get_attention_tp_size(),
                         ),
                         "swa_head_dim": self.model_config.hf_text_config.swa_head_dim,
-                        "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
-                        "v_head_dim": self.model_config.hf_text_config.v_head_dim,
+                        "swa_v_head_dim": self.model_config.swa_v_head_dim,
+                        "v_head_dim": self.model_config.v_head_dim,
                     }
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
@@ -434,8 +434,8 @@ class ModelRunnerKVCacheMixin:
                             // get_attention_tp_size(),
                         ),
                         "swa_head_dim": self.model_config.hf_text_config.swa_head_dim,
-                        "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
-                        "v_head_dim": self.model_config.hf_text_config.v_head_dim,
+                        "swa_v_head_dim": self.model_config.swa_v_head_dim,
+                        "v_head_dim": self.model_config.v_head_dim,
                     }
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
