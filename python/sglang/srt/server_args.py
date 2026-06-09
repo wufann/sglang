@@ -1975,15 +1975,17 @@ class ServerArgs:
                 if self.enable_prefill_context_parallel and self.use_mla_backend():
                     logger.warning(
                         "MLA prefill context parallel is still experimental. "
-                        "Verified on Hopper with the fa3 backend."
+                        "Verified on Hopper with fa3, and on AMD with aiter "
+                        "(non-absorbed, page_size=1)."
                     )
                     self.enable_dp_attention = True
                     # TODO(kpham-sgl) Supports moe_dense_tp_size != 1.
                     self.moe_dense_tp_size = 1
-                    self.moe_a2a_backend = "deepep"
+                    if self.moe_a2a_backend not in ("deepep", "mori"):
+                        self.moe_a2a_backend = "deepep"
                     self.ep_size = self.tp_size
                     logger.warning(
-                        "For MLA CP, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
+                        "For MLA CP, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend in {deepep, mori}, ep_size == tp_size, batch_size == 1"
                     )
                     # FIXME(kpham-sgl): Keep attn_tp_size == 1 under MLA CP.
                     # DSACPLayerCommunicator does not all-reduce attention-TP

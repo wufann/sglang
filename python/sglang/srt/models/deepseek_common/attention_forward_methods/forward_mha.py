@@ -9,6 +9,7 @@ from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_p
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -253,6 +254,22 @@ class DeepseekMHAForwardMixin:
         if self.rotary_emb is not None:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
+
+        if mla_use_prefill_cp(forward_batch):
+            # Non-absorbed MLA prefill CP: kv_a/k_pe arrive rank-local
+            # (zigzag half) but out_cache_loc is full-sequence-sized, so
+            # the cache write would index OOB. Allgather to full-sequence
+            # via rebuild_cp_kv_cache, matching the absorbed path.
+            # rebuild_cp_kv_cache expects 2-D latent_cache (forward_mla
+            # convention); forward_mha keeps it 3-D, so squeeze for the
+            # call and reassign latent_cache to the gathered buffer.
+            latent_cache_2d = latent_cache.squeeze(1)
+            k_nope_full, k_pe_full = self.rebuild_cp_kv_cache(
+                latent_cache_2d, forward_batch, kv_a.unsqueeze(1), k_pe
+            )
+            kv_a = k_nope_full.squeeze(1)
+            k_pe = k_pe_full
+            latent_cache = latent_cache_2d.unsqueeze(1)
 
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
         if (

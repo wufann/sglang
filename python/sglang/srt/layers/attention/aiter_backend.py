@@ -69,6 +69,10 @@ from sglang.srt.layers.attention.utils import (
     pad_sequence_with_mask,
 )
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+from sglang.srt.layers.utils.cp_utils import (
+    cp_attn_forward_extend,
+    mla_use_prefill_cp,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var
 
@@ -2084,8 +2088,15 @@ class AiterAttnBackend(AttentionBackend):
                 and not forward_batch.forward_mode.is_draft_extend()
                 and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
+                _is_cp = mla_use_prefill_cp(forward_batch)
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
-                if kv_indices.shape[0] == 0 or extend_no_prefix:
+                # Under CP, the latent KV pool is fully populated by
+                # cp_allgather_and_save_kv_cache upstream, so the
+                # "no prefix / empty kv_indices" short-circuit (which only
+                # attends within this rank's q chunk) would skip the cross-rank
+                # KV and corrupt the output. Force CP through the elif branch,
+                # which builds per-half kv_indices from req_to_token.
+                if not _is_cp and (kv_indices.shape[0] == 0 or extend_no_prefix):
                     if _use_fp8_prefill_attn:
                         output = self.mla_fp8_prefill_attn(
                             q,
@@ -2107,6 +2118,120 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     return output
                 elif layer.qk_head_dim != (kv_lora_rank + qk_rope_head_dim):
+                    if _is_cp:
+                        assert not _use_fp8_prefill_attn, (
+                            "MLA prefill CP on aiter does not support FP8 prefill yet; "
+                            "set SGLANG_AITER_FP8_PREFILL_ATTN=0"
+                        )
+                        assert self.page_size == 1, (
+                            "MLA prefill CP on aiter currently requires page_size=1"
+                        )
+                        K_Buffer_full = K_Buffer
+                        kv_b_proj = layer.kv_b_proj
+                        kv_cache_dtype_local = self.kv_cache_dtype
+                        q_dtype = q.dtype
+                        tp_k_head_num = layer.tp_k_head_num
+                        v_head_dim_l = layer.v_head_dim
+                        kv_lora_rank_l = kv_lora_rank
+                        qk_rope_head_dim_l = qk_rope_head_dim
+                        qk_nope_head_dim_l = qk_nope_head_dim
+                        scaling = layer.scaling
+                        req_to_token = self.req_to_token
+                        req_pool_indices_l = forward_batch.req_pool_indices
+                        bs_cp = req_pool_indices_l.shape[0]
+                        rt_stride = req_to_token.stride(0)
+
+                        def _aiter_mla_cp_varlen(
+                            q_chunk,
+                            cu_seqlens_q_cp,
+                            cache_seqlens_cp,
+                            max_seqlen_q_cp,
+                        ):
+                            # Build per-half kv_indptr / kv_indices using the
+                            # zigzag-aware kv_len (cache_seqlens_cp), gather
+                            # latent KV, decompress via kv_b_proj, then call
+                            # flash_attn_varlen_func on the half.
+                            kv_indptr_cp = torch.empty(
+                                bs_cp + 1,
+                                dtype=torch.int32,
+                                device=cache_seqlens_cp.device,
+                            )
+                            kv_indptr_cp[0] = 0
+                            torch.cumsum(
+                                cache_seqlens_cp,
+                                dim=0,
+                                dtype=torch.int32,
+                                out=kv_indptr_cp[1:],
+                            )
+                            total_kv = int(cache_seqlens_cp.sum().item())
+                            kv_indices_cp = torch.empty(
+                                total_kv,
+                                dtype=torch.int32,
+                                device=cache_seqlens_cp.device,
+                            )
+                            create_flashinfer_kv_indices_triton[(bs_cp,)](
+                                req_to_token,
+                                req_pool_indices_l,
+                                cache_seqlens_cp,
+                                kv_indptr_cp,
+                                None,
+                                kv_indices_cp,
+                                rt_stride,
+                            )
+
+                            K_gather = torch.index_select(
+                                K_Buffer_full, 0, kv_indices_cp
+                            )
+                            kvc_h, k_pe_h = torch.split(
+                                K_gather,
+                                [kv_lora_rank_l, qk_rope_head_dim_l],
+                                dim=-1,
+                            )
+                            if kv_cache_dtype_local == fp8_dtype:
+                                kvc_h = kvc_h.to(q_dtype)
+                                k_pe_h = k_pe_h.to(q_dtype)
+
+                            kv_h = kv_b_proj(kvc_h.contiguous())[0]
+                            kv_h = kv_h.view(
+                                -1,
+                                tp_k_head_num,
+                                qk_nope_head_dim_l + v_head_dim_l,
+                            )
+                            k_h, v_h = torch.split(
+                                kv_h, [qk_nope_head_dim_l, v_head_dim_l], dim=-1
+                            )
+                            k_h = torch.cat(
+                                [
+                                    k_h,
+                                    torch.broadcast_to(
+                                        k_pe_h,
+                                        (
+                                            k_pe_h.shape[0],
+                                            tp_k_head_num,
+                                            k_pe_h.shape[2],
+                                        ),
+                                    ),
+                                ],
+                                dim=-1,
+                            )
+
+                            max_kv_cp = int(cache_seqlens_cp.max().item())
+                            return flash_attn_varlen_func(
+                                q_chunk,
+                                k_h,
+                                v_h,
+                                cu_seqlens_q_cp,
+                                kv_indptr_cp,
+                                max_seqlen_q_cp,
+                                max_kv_cp,
+                                softmax_scale=scaling,
+                                causal=True,
+                            )
+
+                        return cp_attn_forward_extend(
+                            forward_batch, q, self.device, _aiter_mla_cp_varlen
+                        )
+
                     K_Buffer = torch.index_select(K_Buffer, 0, kv_indices)
                     kvc, k_pe = torch.split(
                         K_Buffer, [kv_lora_rank, qk_rope_head_dim], dim=-1
@@ -2175,6 +2300,94 @@ class AiterAttnBackend(AttentionBackend):
                         )
 
                 else:
+                    if mla_use_prefill_cp(forward_batch):
+                        assert self.page_size == 1, (
+                            "MLA prefill CP on aiter currently requires page_size=1"
+                        )
+                        K_Buffer_full = K_Buffer
+                        req_to_token = self.req_to_token
+                        req_pool_indices = forward_batch.req_pool_indices
+                        bs_cp = req_pool_indices.shape[0]
+                        tp_q_head_num = layer.tp_q_head_num
+                        v_head_dim = layer.v_head_dim
+                        qk_head_dim = layer.qk_head_dim
+                        scaling = layer.scaling
+                        logit_cap = layer.logit_cap
+                        rt_stride = req_to_token.stride(0)
+
+                        def _aiter_mla_cp_attn(
+                            q_chunk,
+                            cu_seqlens_q_cp,
+                            cache_seqlens_cp,
+                            max_seqlen_q_cp,
+                        ):
+                            # Build per-half kv_indptr / kv_indices for
+                            # mla_prefill_fwd. page_size==1, so kv_indices is the
+                            # flat list of token slots per seq, taken from
+                            # req_to_token[req_pool_indices[s], :cache_seqlens[s]].
+                            kv_indptr_cp = torch.empty(
+                                bs_cp + 1,
+                                dtype=torch.int32,
+                                device=cache_seqlens_cp.device,
+                            )
+                            kv_indptr_cp[0] = 0
+                            torch.cumsum(
+                                cache_seqlens_cp,
+                                dim=0,
+                                dtype=torch.int32,
+                                out=kv_indptr_cp[1:],
+                            )
+                            total_kv = int(cache_seqlens_cp.sum().item())
+                            kv_indices_cp = torch.empty(
+                                total_kv,
+                                dtype=torch.int32,
+                                device=cache_seqlens_cp.device,
+                            )
+                            create_flashinfer_kv_indices_triton[(bs_cp,)](
+                                req_to_token,
+                                req_pool_indices,
+                                cache_seqlens_cp,
+                                kv_indptr_cp,
+                                None,
+                                kv_indices_cp,
+                                rt_stride,
+                            )
+                            kv_last_page_len_cp = torch.ones(
+                                bs_cp,
+                                dtype=torch.int32,
+                                device=cache_seqlens_cp.device,
+                            )
+
+                            n_tokens_chunk = q_chunk.shape[0]
+                            if qk_head_dim != v_head_dim:
+                                o_chunk = q_chunk.new_empty(
+                                    (n_tokens_chunk, tp_q_head_num * v_head_dim)
+                                )
+                            else:
+                                o_chunk = torch.empty_like(q_chunk)
+
+                            mla_prefill_fwd(
+                                q_chunk.view(-1, tp_q_head_num, qk_head_dim),
+                                K_Buffer_full.view(-1, 1, 1, qk_head_dim),
+                                o_chunk.view(-1, tp_q_head_num, v_head_dim),
+                                cu_seqlens_q_cp,
+                                kv_indptr_cp,
+                                kv_indices_cp,
+                                kv_last_page_len_cp,
+                                max_seqlen_q_cp,
+                                scaling,
+                                logit_cap,
+                            )
+                            return o_chunk
+
+                        o = cp_attn_forward_extend(
+                            forward_batch, q, self.device, _aiter_mla_cp_attn
+                        )
+                        K_Buffer = K_Buffer.view(
+                            -1, layer.tp_k_head_num, layer.qk_head_dim
+                        )
+                        return o
+
                     if layer.qk_head_dim != layer.v_head_dim:
                         o = q.new_empty(
                             (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
