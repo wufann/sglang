@@ -206,6 +206,158 @@ def forward_extend_vectorized_5d(
     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
+def gather_5d_prefix_kv_for_extend(
+    backend: "AiterAttnBackend",
+    layer: "RadixAttention",
+):
+    """Gather the prefix K/V of an extend/verify step from the SHUFFLE 5D
+    pool into a dense LINEAR ``(T, H, D)`` buffer.
+
+    The triton ``extend_attention_fwd`` kernel reads prefix tokens out of
+    the K/V *buffer* indexed by ``forward_metadata.kv_indices`` (one slot
+    id per prefix token) and assumes an NHD ``(num_slots, H, D)`` layout.
+    Under the SHUFFLE 5D layout that raw view is wrong, so we gather the
+    prefix tokens this step references into a dense buffer (row ``i`` =
+    ``kv_indices[i]``) and hand back ``arange(T)`` as the remapped
+    indices. ``kv_indptr`` is unchanged because it already counts prefix
+    tokens in the same request-major order.
+
+    Returns ``(k_lin, v_lin, kv_indices_lin)`` where ``k_lin``/``v_lin``
+    are ``(T, H, head_dim)`` in the pool's compute dtype and
+    ``kv_indices_lin`` is ``arange(T)`` (int64, matching the legacy
+    int64 ``kv_indices`` the kernel expects).
+    """
+    # Gather exactly the slots the kernel would read (``kv_indices``) from
+    # exactly the sub-pool buffer the kernel would read (resolved via
+    # ``layers_mapping`` below, same as ``get_key_buffer``). Placing slot
+    # ``kv_indices[i]`` at dense row ``i`` and handing back ``arange`` keeps
+    # the prefix mapping correct regardless of any SWA slot translation.
+    slot_ids = backend.forward_metadata.kv_indices
+
+    pool = backend.token_to_kv_pool
+    if hasattr(pool, "layers_mapping"):
+        sub_layer_id, sub_is_swa = pool.layers_mapping[layer.layer_id]
+        sub_pool = pool.swa_kv_pool if sub_is_swa else pool.full_kv_pool
+    else:
+        sub_pool = pool
+        sub_layer_id = layer.layer_id
+    k_buf = sub_pool.k_buffer[sub_layer_id - sub_pool.start_layer]
+    v_buf = sub_pool.v_buffer[sub_layer_id - sub_pool.start_layer]
+
+    slot_ids_i = slot_ids.to(torch.int32)
+    k_lin, v_lin = launch_gather_shuffle_5d_to_linear(k_buf, v_buf, slot_ids_i)
+    if sub_pool.store_dtype != sub_pool.dtype:
+        k_lin = k_lin.view(sub_pool.dtype)
+        v_lin = v_lin.view(sub_pool.dtype)
+
+    kv_indices_lin = torch.arange(
+        slot_ids.shape[0], dtype=torch.int64, device=k_lin.device
+    )
+    return k_lin, v_lin, kv_indices_lin
+
+
+def forward_verify_vectorized_5d(
+    backend: "AiterAttnBackend",
+    q: torch.Tensor,
+    layer: "RadixAttention",
+    forward_batch: "ForwardBatch",
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    o: torch.Tensor,
+    sinks,
+) -> None:
+    """EAGLE target_verify (topk==1) specialization for the SHUFFLE 5D pool.
+
+    Mirrors :func:`forward_decode_vectorized_5d` but with
+    ``query_length = num_draft_tokens`` so ``pa_decode_gluon`` applies
+    causal masking across the draft chain (``is_causal = query_length > 1``
+    inside the kernel). topk==1 makes the draft a linear chain, so a pure
+    causal mask is exactly the verify mask — no tree mask needed.
+
+    Reuses the unified-verify metadata built in init_forward_metadata:
+    ``forward_metadata.kv_indices`` is the 2D full-attn page table and
+    ``forward_metadata.swa_page_table`` the SWA one, both already covering
+    prefix + freshly committed draft tokens. context_lengths therefore
+    include the draft tokens (``seq_lens + num_draft_tokens``).
+
+    Writes the attention output into ``o`` in place.
+    """
+    bs = forward_batch.batch_size
+    num_kv_heads = layer.tp_k_head_num
+    num_q_heads = layer.tp_q_head_num
+    q_group = num_q_heads // num_kv_heads
+    query_length = backend.num_draft_tokens
+    is_swa_layer = (
+        layer.sliding_window_size is not None and layer.sliding_window_size > -1
+    )
+
+    if is_swa_layer:
+        block_tables_pa = (
+            backend.forward_metadata.swa_page_table
+            if backend.forward_metadata.swa_page_table is not None
+            else backend.forward_metadata.kv_indices
+        )
+        ctx_part = 256
+        max_part_num = 1
+        sliding_window_arg = int(layer.sliding_window_size)
+    else:
+        block_tables_pa = backend.forward_metadata.kv_indices
+        ctx_part = 256
+        max_part_num = get_recommended_splits(bs, num_kv_heads)
+        sliding_window_arg = 0
+
+    # The draft tokens for this step are already committed to the cache, so the
+    # context length each query attends over is prefix + num_draft_tokens. The
+    # add must run inside the cuda graph region to keep captured pointers valid.
+    context_lengths = forward_batch.seq_lens + query_length
+
+    q_in = q.view(-1, num_q_heads, layer.qk_head_dim)
+    o_view = o.view(-1, num_q_heads, layer.v_head_dim)
+
+    # Scratch shapes use the gluon-equivalent query group size
+    # (query_length * q_group) so the kernel's MTP layout matches.
+    eq_q_group = query_length * q_group
+    exp_sums = torch.empty(
+        (bs, num_kv_heads, max_part_num, eq_q_group),
+        dtype=torch.float32,
+        device=q_in.device,
+    )
+    max_logits = torch.empty_like(exp_sums)
+    temporary_output = torch.empty(
+        (bs, num_kv_heads, max_part_num, eq_q_group, layer.qk_head_dim),
+        dtype=q_in.dtype,
+        device=q_in.device,
+    )
+
+    key_scale = None
+    value_scale = None
+    if backend.kv_cache_dtype == fp8_dtype:
+        key_scale = layer.k_scale if layer.k_scale is not None else backend.k_scale
+        value_scale = layer.v_scale if layer.v_scale is not None else backend.v_scale
+
+    pa_decode_gluon(
+        output=o_view,
+        query=q_in,
+        key_cache=k_cache,
+        value_cache=v_cache,
+        context_lengths=context_lengths,
+        block_tables=block_tables_pa,
+        softmax_scale=layer.scaling,
+        query_length=query_length,
+        max_context_partition_num=max_part_num,
+        context_partition_size=ctx_part,
+        compute_type=backend.input_dtype,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=temporary_output,
+        sinks=sinks,
+        sliding_window=sliding_window_arg,
+        ps=True,
+    )
+
+
 def forward_decode_vectorized_5d(
     backend: "AiterAttnBackend",
     q: torch.Tensor,

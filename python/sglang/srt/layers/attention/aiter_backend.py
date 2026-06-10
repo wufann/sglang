@@ -63,6 +63,8 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
+    forward_verify_vectorized_5d,
+    gather_5d_prefix_kv_for_extend,
 )
 from sglang.srt.layers.attention.utils import (
     launch_reshape_and_cache_flash,
@@ -1817,6 +1819,10 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                 )
             else:
+                # The unified verify metadata (paged block_table) is reused for
+                # both the NHD unified_attention path and the SHUFFLE 5D
+                # pa_decode_gluon path — only the kernel differs in
+                # forward_extend. So build it whenever unified verify is active.
                 if self._use_unified_verify:
                     max_num_blocks_per_seq = (
                         self.max_context_len + self.page_size - 1
@@ -2365,6 +2371,19 @@ class AiterAttnBackend(AttentionBackend):
                     self._use_unified_verify
                     and forward_batch.forward_mode.is_target_verify()
                 ):
+                    # The SHUFFLE 5D pool can't be read by unified_attention's
+                    # NHD view; route topk==1 verify through pa_decode_gluon
+                    # instead (query_length = num_draft_tokens enables causal
+                    # masking, which the linear topk==1 draft chain needs).
+                    if self.kv_cache_is_vectorized_5d:
+                        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
+                            layer.layer_id
+                        )
+                        forward_verify_vectorized_5d(
+                            self, q, layer, forward_batch, k_cache, v_cache, o, sinks
+                        )
+                        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
                     k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
                     )
@@ -2419,16 +2438,42 @@ class AiterAttnBackend(AttentionBackend):
                     )
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+                # draft_extend (and non-unified verify): the triton extend
+                # kernel reads prefix tokens from the K/V buffer assuming an
+                # NHD ``(num_slots, H, D)`` layout. Under the SHUFFLE 5D pool
+                # that raw view is wrong, so gather the referenced prefix slots
+                # into a dense linear buffer and remap kv_indices to arange. The
+                # extend (k/v) tensors are passed in directly and are
+                # unaffected. draft_extend's kv_indices is compact (from
+                # generate_attn_arg_prefill), so the gather stays bounded.
+                if self.kv_cache_is_vectorized_5d:
+                    k_buffer, v_buffer, kv_indices = gather_5d_prefix_kv_for_extend(
+                        self, layer
+                    )
+                else:
+                    k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                    v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                    kv_indices = self.forward_metadata.kv_indices
+
+                # MiMo SWA layers carry an attention sink bias and a sliding
+                # window; forward both so the draft matches the target's SWA
+                # math (missing them systematically biases the draft and
+                # lowers the EAGLE acceptance rate).
+                extend_sliding_window = (
+                    layer.sliding_window_size
+                    if layer.sliding_window_size is not None
+                    else -1
+                )
                 self.extend_attention_fwd(
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k.contiguous(),
                     v.contiguous(),
                     o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                    self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                    self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                    k_buffer,
+                    v_buffer,
                     self.forward_metadata.qo_indptr,
                     self.forward_metadata.kv_indptr,
-                    self.forward_metadata.kv_indices,
+                    kv_indices,
                     self.forward_metadata.custom_mask,
                     True,  # causal
                     self.forward_metadata.mask_indptr,
@@ -2437,6 +2482,8 @@ class AiterAttnBackend(AttentionBackend):
                     1.0,  # v_scale
                     layer.scaling,
                     logit_cap=layer.logit_cap,
+                    sliding_window_size=extend_sliding_window,
+                    sinks=sinks,
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

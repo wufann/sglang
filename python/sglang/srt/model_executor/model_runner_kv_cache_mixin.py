@@ -605,15 +605,25 @@ class ModelRunnerKVCacheMixin:
             if self.is_hybrid_swa:
                 kwargs = {}
                 if self.is_hybrid_swa_compress:
+                    hf_text_config = self.model_config.hf_text_config
+                    v_head_dim = hf_text_config.v_head_dim
+                    swa_v_head_dim = hf_text_config.swa_v_head_dim
+                    # aiter attention kernels require D_k == D_v, so V is
+                    # zero-padded to head_dim in the model (see mimo_v2.py).
+                    # Size the V cache at head_dim to match. Triton keeps the
+                    # native asymmetric V dim.
+                    if self.server_args.attention_backend == "aiter":
+                        v_head_dim = hf_text_config.head_dim
+                        swa_v_head_dim = hf_text_config.swa_head_dim
                     kwargs = {
                         "swa_head_num": max(
                             1,
-                            self.model_config.hf_text_config.swa_num_key_value_heads
+                            hf_text_config.swa_num_key_value_heads
                             // get_attention_tp_size(),
                         ),
-                        "swa_head_dim": self.model_config.hf_text_config.swa_head_dim,
-                        "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
-                        "v_head_dim": self.model_config.hf_text_config.v_head_dim,
+                        "swa_head_dim": hf_text_config.swa_head_dim,
+                        "swa_v_head_dim": swa_v_head_dim,
+                        "v_head_dim": v_head_dim,
                     }
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
