@@ -62,6 +62,7 @@ except ImportError:
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
+    forward_draft_extend_vectorized_5d,
     forward_extend_vectorized_5d,
     forward_verify_vectorized_5d,
     gather_5d_prefix_kv_for_extend,
@@ -1889,6 +1890,64 @@ class AiterAttnBackend(AttentionBackend):
 
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[1 : bs + 1] = torch.cumsum(extend_lens, dim=0)
+            kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+            max_q_len = num_tokens_per_bs
+
+            if self.kv_cache_is_vectorized_5d and self.use_triton_unified_attention:
+                # SHUFFLE 5D draft-extend: route through pa_decode_gluon against
+                # the paged pool (cuda-graph safe) instead of the gather path
+                # whose buffers overflow on replay. Build a block-level 2D page
+                # table covering seq_lens (which already includes the freshly
+                # written draft tokens), mirroring the verify metadata but with
+                # draft_num=0. qo_indptr/max_q_len stay as set above for any
+                # non-attention consumers; the kernel derives query_length from
+                # q directly.
+                max_num_blocks_per_seq = (
+                    self.max_context_len + self.page_size - 1
+                ) // self.page_size
+                page_table = self.cuda_graph_page_table[:bs]
+                swa_page_table = None
+                swa_slot_mapping = None
+                if self.use_sliding_window_kv_pool:
+                    swa_page_table = self.cuda_graph_swa_page_table.view(
+                        -1, max_num_blocks_per_seq
+                    )[:bs]
+                    swa_slot_mapping = (
+                        self.token_to_kv_pool.full_to_swa_index_mapping.long()
+                    )
+
+                # Block-level page table covering seq_lens (draft tokens already
+                # counted). draft_num=0 because seq_lens is post-write here,
+                # unlike target_verify where draft K/V is added on top.
+                BLOCK_SIZE = 1024
+                grid = (bs, triton.cdiv(max(max_num_blocks_per_seq, 1), BLOCK_SIZE))
+                scatter_req_to_token_to_page_table_kernel[grid](
+                    self.req_to_token,
+                    req_pool_indices,
+                    seq_lens,
+                    page_table,
+                    self.req_to_token.stride(0),
+                    page_table.stride(0),
+                    swa_page_table,
+                    swa_slot_mapping,
+                    DRAFT_NUM=0,
+                    PAGE_SIZE=self.page_size,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                    HAS_SWA=(swa_slot_mapping is not None),
+                )
+                max_kv_len_unified = max_num_blocks_per_seq * self.page_size
+                self.forward_metadata = ForwardMetadata(
+                    None,
+                    page_table,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    max_kv_len_unified,
+                    max_extend_len=max_q_len,
+                    swa_page_table=swa_page_table,
+                )
+                return
+
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
@@ -1901,9 +1960,6 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
-
-            kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
-            max_q_len = num_tokens_per_bs
 
             if self.use_mla and _use_mla_ps_kernel:
                 num_kv_splits = self.max_split_per_batch
@@ -2484,6 +2540,32 @@ class AiterAttnBackend(AttentionBackend):
                     logit_cap=layer.logit_cap,
                     sliding_window_size=extend_sliding_window,
                     sinks=sinks,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            # SHUFFLE 5D DRAFT_EXTEND_V2: route through the paged pa_decode_gluon
+            # kernel against the fixed-size pool (cuda-graph safe). The gather
+            # path below sizes its dense buffers from the runtime seq_lens_sum,
+            # which overflows on graph replay (buffers captured at the tiny
+            # capture-time seq_lens). Gated on the same 2D page-table metadata
+            # built in _apply_cuda_graph_metadata (run_graph path); the non-graph
+            # path keeps the flat-kv_indices gather.
+            if (
+                self.kv_cache_is_vectorized_5d
+                and self.use_triton_unified_attention
+                and forward_batch.forward_mode.is_draft_extend_v2()
+                and self.forward_metadata.kv_indptr is None
+            ):
+                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                if layer.qk_head_dim != layer.v_head_dim:
+                    o = q.new_empty(
+                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                        dtype=self.input_dtype,
+                    )
+                else:
+                    o = torch.empty_like(q, dtype=self.input_dtype)
+                forward_draft_extend_vectorized_5d(
+                    self, q, layer, forward_batch, k_cache, v_cache, o, sinks
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

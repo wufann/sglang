@@ -41,6 +41,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+# pa_decode_gluon hard-caps query_length at 4 (kernel MTP layout limit).
+_GLUON_MAX_QUERY_LEN = 4
+
 
 def forward_extend_vectorized_5d(
     backend: "AiterAttnBackend",
@@ -356,6 +359,140 @@ def forward_verify_vectorized_5d(
         sliding_window=sliding_window_arg,
         ps=True,
     )
+
+
+def forward_draft_extend_vectorized_5d(
+    backend: "AiterAttnBackend",
+    q: torch.Tensor,
+    layer: "RadixAttention",
+    forward_batch: "ForwardBatch",
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    o: torch.Tensor,
+    sinks,
+) -> None:
+    """EAGLE DRAFT_EXTEND_V2 (topk==1) specialization for the SHUFFLE 5D pool.
+
+    The legacy gather-and-linearize path
+    (:func:`forward_extend_vectorized_5d`) sizes its dense KV buffer and
+    ``arange`` indices from the runtime ``seq_lens_sum``. Under the
+    draft-extend CUDA graph those buffers are captured at the tiny
+    capture-time ``seq_lens`` (``num_tokens_per_bs`` per row) and then
+    replayed against the real prefix length, so the captured kernel walks
+    far past the buffer end -> GPU memory access fault. This routes the
+    step through ``pa_decode_gluon`` against the fixed-size paged KV pool
+    instead (same kernel/metadata family as
+    :func:`forward_verify_vectorized_5d` and the decode path), which is
+    cuda-graph safe because every buffer is pool-sized and only the page
+    table contents change on replay.
+
+    The per-request extend length ``L = q rows / bs`` is the multi-layer
+    eagle ``num_tokens_per_bs`` (``speculative_num_steps + 1 + step``),
+    which can exceed ``pa_decode_gluon``'s hard ``query_length <= 4``
+    cap. So the query block (request-major, request ``b`` at rows
+    ``[b*L, (b+1)*L)``) is split along the query axis into chunks of at
+    most ``_GLUON_MAX_QUERY_LEN`` tokens. For chunk ``[c0, c0+cs)`` the
+    kernel's bottom-right causal mask attends query token ``j`` to
+    ``col <= context_length - (cs - 1 - j)``; setting
+    ``context_length = prefix + c0 + cs`` (``prefix = seq_len - L``) makes
+    that exactly ``col <= prefix + (c0 + j)`` — the correct causal range
+    for global query index ``c0 + j`` in the topk==1 linear chain.
+
+    ``forward_batch.seq_lens`` already includes the freshly committed
+    draft tokens (see ``prepare_for_extend_to_fill_draft_kvcache``), so
+    ``prefix = seq_lens - L``. The chunk count is fixed at capture (``L``
+    is fixed per runner/step), keeping the path cuda-graph safe.
+
+    Writes the attention output into ``o`` in place.
+    """
+    bs = forward_batch.batch_size
+    num_kv_heads = layer.tp_k_head_num
+    num_q_heads = layer.tp_q_head_num
+    q_group = num_q_heads // num_kv_heads
+    extend_len = q.shape[0] // bs
+    is_swa_layer = (
+        layer.sliding_window_size is not None and layer.sliding_window_size > -1
+    )
+
+    if is_swa_layer:
+        block_tables_pa = (
+            backend.forward_metadata.swa_page_table
+            if backend.forward_metadata.swa_page_table is not None
+            else backend.forward_metadata.kv_indices
+        )
+        ctx_part = 256
+        max_part_num = 1
+        sliding_window_arg = int(layer.sliding_window_size)
+    else:
+        block_tables_pa = backend.forward_metadata.kv_indices
+        ctx_part = 256
+        max_part_num = get_recommended_splits(bs, num_kv_heads)
+        sliding_window_arg = 0
+
+    key_scale = None
+    value_scale = None
+    if backend.kv_cache_dtype == fp8_dtype:
+        key_scale = layer.k_scale if layer.k_scale is not None else backend.k_scale
+        value_scale = layer.v_scale if layer.v_scale is not None else backend.v_scale
+
+    # prefix = tokens before this step's query block; seq_lens already
+    # counts the L draft tokens of this block.
+    prefix_lens = forward_batch.seq_lens - extend_len
+
+    q_b = q.view(bs, extend_len, num_q_heads, layer.qk_head_dim)
+    o_b = o.view(bs, extend_len, num_q_heads, layer.v_head_dim)
+
+    for c0 in range(0, extend_len, _GLUON_MAX_QUERY_LEN):
+        cs = min(_GLUON_MAX_QUERY_LEN, extend_len - c0)
+
+        q_chunk = q_b[:, c0 : c0 + cs].reshape(bs * cs, num_q_heads, layer.qk_head_dim)
+        q_chunk = q_chunk.contiguous()
+        o_chunk = torch.empty(
+            (bs * cs, num_q_heads, layer.v_head_dim),
+            dtype=q_chunk.dtype,
+            device=q_chunk.device,
+        )
+
+        # Bottom-right causal context for this chunk; arithmetic stays in the
+        # graph region to keep captured pointers valid.
+        context_lengths = prefix_lens + (c0 + cs)
+
+        eq_q_group = cs * q_group
+        exp_sums = torch.empty(
+            (bs, num_kv_heads, max_part_num, eq_q_group),
+            dtype=torch.float32,
+            device=q_chunk.device,
+        )
+        max_logits = torch.empty_like(exp_sums)
+        temporary_output = torch.empty(
+            (bs, num_kv_heads, max_part_num, eq_q_group, layer.qk_head_dim),
+            dtype=q_chunk.dtype,
+            device=q_chunk.device,
+        )
+
+        pa_decode_gluon(
+            output=o_chunk,
+            query=q_chunk,
+            key_cache=k_cache,
+            value_cache=v_cache,
+            context_lengths=context_lengths,
+            block_tables=block_tables_pa,
+            softmax_scale=layer.scaling,
+            query_length=cs,
+            max_context_partition_num=max_part_num,
+            context_partition_size=ctx_part,
+            compute_type=backend.input_dtype,
+            key_scale=key_scale,
+            value_scale=value_scale,
+            exp_sums=exp_sums,
+            max_logits=max_logits,
+            temporary_output=temporary_output,
+            sinks=sinks,
+            sliding_window=sliding_window_arg,
+            ps=True,
+        )
+
+        o_b[:, c0 : c0 + cs] = o_chunk.view(bs, cs, num_q_heads, layer.v_head_dim)
 
 
 def forward_decode_vectorized_5d(
