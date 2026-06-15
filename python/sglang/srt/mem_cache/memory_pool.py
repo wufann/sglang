@@ -1144,13 +1144,29 @@ class MHATokenToKVPool(KVCache):
             self._get_value_buffer(i).nbytes
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
-        kv_item_lens = [
-            self._get_key_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ] + [
-            self._get_value_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ]
+        # item_len = bytes of one page (page_size tokens). For NHD, buffer[0] is a
+        # single token, so multiply by page_size. For the vectorized_5d SHUFFLE
+        # layout the outer dim is already the block/page (num_blocks, H, D/x,
+        # page, x), so buffer[0] is one full page and must NOT be multiplied
+        # again — doing so overstates item_len by page_size and makes mooncake's
+        # page-indexed transfer (src_ptr + page_idx * item_len) run off the end
+        # of the pool, segfaulting in batch_transfer_sync.
+        if self.kv_cache_layout == "vectorized_5d":
+            kv_item_lens = [
+                self._get_key_buffer(i)[0].nbytes
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ] + [
+                self._get_value_buffer(i)[0].nbytes
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
+        else:
+            kv_item_lens = [
+                self._get_key_buffer(i)[0].nbytes * self.page_size
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ] + [
+                self._get_value_buffer(i)[0].nbytes * self.page_size
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def get_cpu_copy(self, indices, mamba_indices=None):
