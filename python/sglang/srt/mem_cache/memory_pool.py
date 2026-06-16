@@ -1300,6 +1300,36 @@ class MHATokenToKVPool(KVCache):
             same_kv_dim=self.same_kv_dim,
         )
 
+    def zero_slots(self, indices: torch.Tensor):
+        """Zero K/V at the given absolute pool slot indices, all layers.
+
+        Used after a PD whole-page KV transfer to scrub the partial-page tail
+        (slots past the prompt length up to the page boundary). Those slots
+        receive stale bytes from the prefill node's reused page; verify-path
+        attention partitions can fold them into softmax stats and bias logits.
+        Handles both NHD and SHUFFLE 5D physical layouts.
+        """
+        if self.layer_num == 0 or indices.numel() == 0:
+            return
+        if self.kv_cache_layout == "vectorized_5d":
+            page = self.page_size
+            x = self._kv_vector_x
+            block_idx = indices // page
+            slot_in_page = indices % page
+            page_outer = slot_in_page // x
+            page_inner = slot_in_page % x
+            for layer_id in range(self.layer_num):
+                # K: (num_blocks, H, D_k//x, page, x) -> zero the `page` slot.
+                self.k_buffer[layer_id][block_idx, :, :, slot_in_page, :] = 0
+                # V: (num_blocks, H, page//x, D_v, x) -> zero (page_outer, page_inner).
+                self.v_buffer[layer_id][
+                    block_idx, :, page_outer, :, page_inner
+                ] = 0
+        else:
+            for layer_id in range(self.layer_num):
+                self.k_buffer[layer_id][indices] = 0
+                self.v_buffer[layer_id][indices] = 0
+
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
         if self.layer_num == 0:

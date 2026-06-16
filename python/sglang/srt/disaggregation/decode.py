@@ -1543,10 +1543,64 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ].tolist()
             )
 
+        self._maybe_zero_partial_page_tail(decode_req)
+
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return
+
+    def _maybe_zero_partial_page_tail(self, decode_req: DecodeRequest):
+        """Scrub the partial-page tail of freshly transferred prompt KV.
+
+        Whole-page PD transfer copies the prefill node's reused page verbatim,
+        so slots [prompt_len, page_boundary) carry stale KV. The spec verify
+        attention partition can fold these into softmax stats and bias logits,
+        corrupting EAGLE acceptance. Decode (query_length=1) masks them out;
+        verify (query_length>1) does not. Locally-allocated pages are zeros, so
+        this only matters for transferred KV.
+        """
+        allocator = self.scheduler.token_to_kv_pool_allocator
+        page_size = allocator.page_size
+        if page_size <= 1:
+            return
+        token_to_kv_pool = allocator.get_kvcache()
+        if not hasattr(token_to_kv_pool, "zero_slots"):
+            return
+        seq_len = len(decode_req.req.origin_input_ids)
+        if seq_len <= 0:
+            return
+        # Tail length within the last (partial) page that holds the prompt.
+        tail_len = (-seq_len) % page_size
+        if tail_len == 0:
+            return
+        # The last valid prompt token's PHYSICAL slot. req_to_token is only
+        # written for [0, fill_len); reading past it would return stale slot
+        # ids from a prior occupant of this req_pool_idx and zeroing those
+        # would corrupt OTHER live requests' KV. Pages are allocated
+        # page-aligned and contiguous, so the partial-page tail occupies the
+        # physical slots immediately after the last prompt slot.
+        last_slot = int(
+            self.scheduler.req_to_token_pool.req_to_token[
+                decode_req.req.req_pool_idx, seq_len - 1
+            ].item()
+        )
+        # Guard: the tail must stay inside last_slot's physical page. If the
+        # last prompt slot is itself the page's final slot, or zeroing would
+        # cross into the next physical page (e.g. non-contiguous SWA tail
+        # alloc), skip — never touch a neighbouring page that may belong to
+        # another request.
+        if last_slot % page_size != (seq_len - 1) % page_size:
+            return
+        if last_slot + tail_len >= (last_slot // page_size + 1) * page_size:
+            return
+        tail_slots = torch.arange(
+            last_slot + 1,
+            last_slot + 1 + tail_len,
+            dtype=torch.int64,
+            device=self.scheduler.req_to_token_pool.req_to_token.device,
+        )
+        token_to_kv_pool.zero_slots(tail_slots)
 
     def _poll_with_metadata_gate(self) -> List[int]:
         pollers = (
