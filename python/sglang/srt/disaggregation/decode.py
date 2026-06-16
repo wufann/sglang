@@ -1600,7 +1600,25 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             dtype=torch.int64,
             device=self.scheduler.req_to_token_pool.req_to_token.device,
         )
-        token_to_kv_pool.zero_slots(tail_slots)
+        # The KV scrub is a WRITE to the shared KV pool and MUST be ordered
+        # against the verify/draft forward (which reads + writes these pages on
+        # forward_stream). Committing runs on schedule_stream; issuing the zero
+        # there races the forward under overlap scheduling and silently
+        # corrupts KV at high concurrency (accuracy degrades as concurrency
+        # rises). Issue it on forward_stream so it serializes with the
+        # subsequent run_batch on the same stream. The transfer->zero order is
+        # already guaranteed: KVPoll.Success means the whole-page transfer
+        # completed before this commit. Mirrors the forward_stream_ctx +
+        # wait_stream(schedule_stream) idiom used elsewhere in the scheduler.
+        forward_stream_ctx = getattr(self.scheduler, "forward_stream_ctx", None)
+        if forward_stream_ctx is not None:
+            with forward_stream_ctx:
+                self.scheduler.forward_stream.wait_stream(
+                    self.scheduler.schedule_stream
+                )
+                token_to_kv_pool.zero_slots(tail_slots)
+        else:
+            token_to_kv_pool.zero_slots(tail_slots)
 
     def _poll_with_metadata_gate(self) -> List[int]:
         pollers = (
