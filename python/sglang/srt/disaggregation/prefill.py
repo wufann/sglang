@@ -593,13 +593,6 @@ class SchedulerDisaggregationPrefillMixin:
                     req.output_topk_p = spec_src.topk_p[i]
                     req.output_topk_index = spec_src.topk_index[i]
                     req.hidden_states_tensor = spec_src.hidden_states[i].cpu().clone()
-                    if i == 0:
-                        logger.error(
-                            f"[PD-DIAG][PREFILL-FIX-OK] src={'result.next_draft_input' if getattr(result, 'next_draft_input', None) is not None else 'batch.spec_info'} "
-                            f"topk_p.shape={tuple(req.output_topk_p.shape)} "
-                            f"topk_p[:4]={req.output_topk_p.flatten()[:4].tolist()} "
-                            f"hidden_nonzero={bool(req.hidden_states_tensor.abs().sum().item() > 0)}"
-                        )
                 else:
                     req.hidden_states_tensor = None
                 if req.return_logprob:
