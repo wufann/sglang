@@ -485,6 +485,18 @@ class MiMoV2Attention(nn.Module):
         self.head_dim = head_dim
         self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
 
+        # aiter attention kernels (mha_batch_prefill_func / SHUFFLE 5D writer)
+        # hard-require D_k == D_v. Zero-pad V up to head_dim so K/V are symmetric
+        # for the kernel, then truncate the attention output back to v_head_dim
+        # before o_proj. The KV pool is sized at head_dim for V to match (see
+        # model_runner_kv_cache_mixin). Triton supports D_k != D_v natively, so
+        # this padding is gated to the aiter backend only.
+        self._pad_v = (
+            get_global_server_args().attention_backend == "aiter"
+            and self.v_head_dim != self.head_dim
+        )
+        self.attn_v_head_dim = self.head_dim if self._pad_v else self.v_head_dim
+
         self.q_size = self.num_heads * self.head_dim
         self.k_size = self.num_kv_heads * self.head_dim
         self.v_size = self.num_kv_heads * self.v_head_dim
@@ -533,7 +545,7 @@ class MiMoV2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            v_head_dim=self.v_head_dim,
+            v_head_dim=self.attn_v_head_dim,
             sliding_window_size=sliding_window_size,  # if is -1 ,normal attention,else ,window attention
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -575,14 +587,35 @@ class MiMoV2Attention(nn.Module):
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
+    def _pad_v_in(self, v: torch.Tensor) -> torch.Tensor:
+        if not self._pad_v:
+            return v
+        v = v.view(-1, self.num_kv_heads, self.v_head_dim)
+        v = F.pad(v, [0, self.head_dim - self.v_head_dim], value=0)
+        return v.reshape(-1, self.num_kv_heads * self.head_dim)
+
+    def _truncate_attn_out(self, attn_output: torch.Tensor) -> torch.Tensor:
+        if not self._pad_v:
+            return attn_output
+        attn_output = attn_output.view(-1, self.num_heads, self.head_dim)[
+            ..., : self.v_head_dim
+        ]
+        return attn_output.reshape(-1, self.num_heads * self.v_head_dim)
+
     def forward_core(self, intermediate_state):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
+        q, k, v, forward_batch = inner_state
+        v = self._pad_v_in(v)
         attn_output = self.attn(
-            *inner_state,
+            q,
+            k,
+            v,
+            forward_batch,
             sinks=self.attention_sink_bias,
         )
+        attn_output = self._truncate_attn_out(attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -601,7 +634,9 @@ class MiMoV2Attention(nn.Module):
 
         if self.v_scale is not None:
             v = v * self.v_scale
+        v = self._pad_v_in(v)
         attn_output = self.attn(q, k, v, forward_batch, sinks=self.attention_sink_bias)
+        attn_output = self._truncate_attn_out(attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 

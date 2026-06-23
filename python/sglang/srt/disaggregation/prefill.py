@@ -633,12 +633,18 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
-                if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
-                    req.output_topk_p = batch.spec_info.topk_p[i]
-                    req.output_topk_index = batch.spec_info.topk_index[i]
-                    req.hidden_states_tensor = (
-                        batch.spec_info.hidden_states[i].cpu().clone()
-                    )
+                # Multi-layer EAGLE returns the prefill draft state on
+                # `result.next_draft_input` and does not assign it back to
+                # `batch.spec_info`; single-layer EAGLE sets `batch.spec_info`
+                # inside `_draft_extend_for_prefill`. Prefer the result field so
+                # both paths feed the disagg metadata buffer.
+                spec_src = getattr(result, "next_draft_input", None)
+                if spec_src is None:
+                    spec_src = batch.spec_info
+                if self.spec_algorithm.is_eagle() and spec_src is not None:
+                    req.output_topk_p = spec_src.topk_p[i]
+                    req.output_topk_index = spec_src.topk_index[i]
+                    req.hidden_states_tensor = spec_src.hidden_states[i].cpu().clone()
                 else:
                     req.hidden_states_tensor = None
                 if req.return_logprob:

@@ -190,6 +190,13 @@ class SWAKVPool(BaseSWAKVPool):
                 layer_id_override=layer_id_pool,
             )
 
+    def zero_slots(self, indices: torch.Tensor):
+        self.full_kv_pool.zero_slots(indices)
+        if self.full_to_swa_index_mapping is not None:
+            swa_indices = self.translate_loc_from_full_to_swa(indices)
+            swa_indices = swa_indices[swa_indices >= 0]
+            self.swa_kv_pool.zero_slots(swa_indices)
+
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
         tgt_loc_swa = self.translate_loc_from_full_to_swa(tgt_loc)

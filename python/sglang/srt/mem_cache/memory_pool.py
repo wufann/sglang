@@ -1328,13 +1328,29 @@ class MHATokenToKVPool(KVCache):
             self._get_value_buffer(i).nbytes
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
-        kv_item_lens = [
-            self._get_key_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ] + [
-            self._get_value_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ]
+        # item_len = bytes of one page (page_size tokens). For NHD, buffer[0] is a
+        # single token, so multiply by page_size. For the vectorized_5d SHUFFLE
+        # layout the outer dim is already the block/page (num_blocks, H, D/x,
+        # page, x), so buffer[0] is one full page and must NOT be multiplied
+        # again — doing so overstates item_len by page_size and makes mooncake's
+        # page-indexed transfer (src_ptr + page_idx * item_len) run off the end
+        # of the pool, segfaulting in batch_transfer_sync.
+        if self.kv_cache_layout == "vectorized_5d":
+            kv_item_lens = [
+                self._get_key_buffer(i)[0].nbytes
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ] + [
+                self._get_value_buffer(i)[0].nbytes
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
+        else:
+            kv_item_lens = [
+                self._get_key_buffer(i)[0].nbytes * self.page_size
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ] + [
+                self._get_value_buffer(i)[0].nbytes * self.page_size
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def get_cpu_copy(self, indices, mamba_indices=None):
@@ -1552,6 +1568,36 @@ class MHATokenToKVPool(KVCache):
             row_dim=self.row_dim,
             store_dtype=self.store_dtype,
         )
+
+    def zero_slots(self, indices: torch.Tensor):
+        """Zero K/V at the given absolute pool slot indices, all layers.
+
+        Used after a PD whole-page KV transfer to scrub the partial-page tail
+        (slots past the prompt length up to the page boundary). Those slots
+        receive stale bytes from the prefill node's reused page; verify-path
+        attention partitions can fold them into softmax stats and bias logits.
+        Handles both NHD and SHUFFLE 5D physical layouts.
+        """
+        if self.layer_num == 0 or indices.numel() == 0:
+            return
+        if self.kv_cache_layout == "vectorized_5d":
+            page = self.page_size
+            x = self._kv_vector_x
+            block_idx = indices // page
+            slot_in_page = indices % page
+            page_outer = slot_in_page // x
+            page_inner = slot_in_page % x
+            for layer_id in range(self.layer_num):
+                # K: (num_blocks, H, D_k//x, page, x) -> zero the `page` slot.
+                self.k_buffer[layer_id][block_idx, :, :, slot_in_page, :] = 0
+                # V: (num_blocks, H, page//x, D_v, x) -> zero (page_outer, page_inner).
+                self.v_buffer[layer_id][
+                    block_idx, :, page_outer, :, page_inner
+                ] = 0
+        else:
+            for layer_id in range(self.layer_num):
+                self.k_buffer[layer_id][indices] = 0
+                self.v_buffer[layer_id][indices] = 0
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
