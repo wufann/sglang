@@ -443,6 +443,11 @@ class Envs:
     # skips the explicit pad. Currently only takes effect on the
     # post_attention_layernorm path with aiter backend and TP=1.
     SGLANG_AITER_FUSE_RMSNORM_PAD = EnvBool(False)
+    # Fuse the input RMSNorm with the qkv_proj activation online quantization on
+    # aiter (ROCm gfx95). When enabled, prepare_attn emits the pre-quantized
+    # (fp8/mxfp4, scale) activation directly into the qkv GEMM, skipping the
+    # GEMM's internal quantization. Opt-in.
+    SGLANG_AITER_FUSE_RMSNORM_QUANT = EnvBool(False)
     # Physical layout for MHA KV cache. "nhd" (default) keeps the existing
     # (size, head_num, head_dim) per-token storage that
     # `aiter.mha.mha_batch_prefill_func`/`unified_attention` consume directly.

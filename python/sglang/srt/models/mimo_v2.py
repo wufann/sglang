@@ -578,7 +578,10 @@ class MiMoV2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if hidden_states.shape[0] == 0:
+        # A fused RMSNorm+quant (fp8, scale[, bf16]) tuple is only produced when
+        # there is at least one token, so the empty-token guard only applies to
+        # plain tensors.
+        if not isinstance(hidden_states, tuple) and hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
@@ -747,6 +750,10 @@ class MiMoV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.layernorm_epsilon
         )
 
+        # Detect aiter (ROCm gfx95) fused RMSNorm + FP8 group quant so prepare_attn
+        # can fuse the input RMSNorm with the qkv_proj activation quantization.
+        self._gfx95_quant_format = self._detect_gfx95_quant_format()
+
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
@@ -762,6 +769,23 @@ class MiMoV2DecoderLayer(nn.Module):
             is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
 
+    def _detect_gfx95_quant_format(self) -> str:
+        from sglang.srt.environ import envs
+        from sglang.srt.models.deepseek_common.utils import _is_gfx95_supported
+
+        if not envs.SGLANG_AITER_FUSE_RMSNORM_QUANT.get():
+            return ""
+        if not _is_gfx95_supported:
+            return ""
+        weight = getattr(getattr(self.self_attn, "qkv_proj", None), "weight", None)
+        if weight is None:
+            return ""
+        if weight.dtype == torch.uint8:
+            return "mxfp4"
+        if weight.dtype == getattr(torch, "float8_e4m3fn", None):
+            return "fp8"
+        return ""
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -771,10 +795,17 @@ class MiMoV2DecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            quant_format=getattr(self, "_gfx95_quant_format", ""),
         )
 
-        if hidden_states.shape[0] != 0:
+        # When the input RMSNorm is fused with the qkv_proj activation
+        # quantization, prepare_attn returns hidden_states as a
+        # (fp8, scale[, bf16]) tuple, which is only produced when there is at
+        # least one token, so the empty-token guard only applies to tensors.
+        if isinstance(hidden_states, tuple) or hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -830,7 +861,12 @@ class MiMoV2DecoderLayer(nn.Module):
         tbo_subbatch_index: Optional[int] = None,
     ):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
-            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+            self.layer_communicator.prepare_attn(
+                hidden_states,
+                residual,
+                forward_batch,
+                quant_format=getattr(self, "_gfx95_quant_format", ""),
+            )
         )
         state.update(
             dict(
