@@ -565,7 +565,18 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             # its own metadata in forward_extend (post-pad), otherwise
             # per-runner attn_backend.forward_metadata is never initialized for
             # draft_runner_list[1+].
-            if not _is_npu:
+            # Same hazard on the AMD/aiter SHUFFLE-5D pool: only
+            # draft_runner_list[0] is pre-planned by prepare_for_draft_extend,
+            # so marking the batch ready would leave draft_runner_list[1+]
+            # reading stale prefill metadata (mismatched qo/kv_indptr) and
+            # crash the 5D gather attention. Leave it unmarked so each step's
+            # forward_extend re-plans its own backend.
+            draft_uses_vec5d = getattr(
+                self.draft_runner_list[0].attn_backend,
+                "kv_cache_is_vectorized_5d",
+                False,
+            )
+            if not _is_npu and not draft_uses_vec5d:
                 forward_batch.mark_forward_metadata_ready()
 
             for step in range(self.speculative_num_steps):
@@ -802,7 +813,18 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # worker has not adopted that fix, so preserve its behavior verbatim.
         # On NPU with --disable-cuda-graph, non-graph verify needs metadata init
         # in forward_extend (post-pad); only mark ready for the cuda-graph path.
-        if not _is_npu or can_run_cuda_graph:
+        # Same on the AMD/aiter SHUFFLE-5D pool: its verify metadata (2D
+        # page_table / swa_page_table for the pa_decode_gluon kernel) is built in
+        # init_forward_metadata, which forward_extend only calls when metadata is
+        # NOT marked ready. Marking ready here would leave forward_verify_
+        # vectorized_5d reading stale/empty metadata and crash. Leave unmarked so
+        # forward_extend re-plans the non-graph path post-pad.
+        target_uses_vec5d = getattr(
+            self.target_worker.model_runner.attn_backend,
+            "kv_cache_is_vectorized_5d",
+            False,
+        )
+        if (not _is_npu and not target_uses_vec5d) or can_run_cuda_graph:
             verify_forward_batch.mark_forward_metadata_ready()
         # Run target verify batch in the main compute stream
         forward_batch_output = self.target_worker.forward_batch_generation(

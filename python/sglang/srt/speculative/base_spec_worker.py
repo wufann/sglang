@@ -169,7 +169,16 @@ class EagleDraftWorkerBase(ABC):
             # On NPU with --disable-cuda-graph, block_table shape won't match
             # after prepare_mlp_sync_batch padding; defer re-init to
             # forward_extend (post-pad) instead.
-            if not is_npu() or can_cuda_graph:
+            # Same on the AMD/aiter SHUFFLE-5D pool with multi-layer eagle:
+            # only draft_runner_list[0] is pre-planned here, but each draft
+            # step runs on its OWN attn_backend. Marking ready would leave
+            # draft_runner_list[1+] reusing stale prefill metadata and crash
+            # the 5D gather attention. Leave unmarked so each step's
+            # forward_extend re-plans its own backend.
+            draft_uses_vec5d = getattr(
+                draft_model_runner.attn_backend, "kv_cache_is_vectorized_5d", False
+            )
+            if (not is_npu() and not draft_uses_vec5d) or can_cuda_graph:
                 forward_batch.mark_forward_metadata_ready()
         return forward_batch
 

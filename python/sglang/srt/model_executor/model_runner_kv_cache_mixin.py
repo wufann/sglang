@@ -1123,7 +1123,32 @@ class ModelRunnerKVCacheMixin:
         config.mem_fraction_static = self.server_args.mem_fraction_static
         return config
 
+    def _maybe_pad_mimo_v2_v_head_dim(self: ModelRunner):
+        """Match the value KV cache width to MiMoV2Attention's padded v_head_dim.
+
+        On AMD aiter, MiMoV2Attention pads V up to the qk head dim for the
+        symmetric attention fast path (see mimo_v2_pads_v_head_dim). The KV cache
+        must use the same width. Mutating the ModelConfig instance here -- before
+        both the pool-size estimator and the pool allocator run -- keeps the two
+        consistent without changing how ModelConfig derives its shapes.
+        """
+        archs = self.model_config.hf_config.architectures or []
+        if not any(arch.startswith("MiMoV2") for arch in archs):
+            return
+
+        from sglang.srt.models.mimo_v2 import mimo_v2_pads_v_head_dim
+
+        if not mimo_v2_pads_v_head_dim():
+            return
+
+        mc = self.model_config
+        if mc.v_head_dim < mc.head_dim:
+            mc.v_head_dim = mc.head_dim
+        if mc.swa_v_head_dim < mc.swa_head_dim:
+            mc.swa_v_head_dim = mc.swa_head_dim
+
     def init_memory_pool(self: ModelRunner, pre_model_load_memory: int):
+        self._maybe_pad_mimo_v2_v_head_dim()
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
             assert (
                 self.memory_pool_config is not None

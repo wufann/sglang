@@ -81,6 +81,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    is_hip,
     is_non_idle_and_non_empty,
     make_layers,
 )
@@ -88,6 +89,23 @@ from sglang.srt.utils import (
 MiMoV2Config = None
 
 logger = logging.getLogger(__name__)
+
+
+def mimo_v2_pads_v_head_dim() -> bool:
+    """Whether MiMo-V2 pads its value head dim up to the qk head dim.
+
+    On AMD (ROCm) with the aiter attention backend, attention runs its fastest
+    path when the value head dim equals the qk head dim. MiMo-V2 has
+    v_head_dim (128) < head_dim (192); when this returns True the model pads V
+    (and its KV cache) up to head_dim. Projection weights are untouched -- the
+    padding happens at runtime around the attention call.
+    """
+    if not is_hip():
+        return False
+    try:
+        return get_global_server_args().attention_backend == "aiter"
+    except Exception:
+        return False
 
 
 def load_mimo_v2_qkv_proj_weight(
@@ -485,6 +503,16 @@ class MiMoV2Attention(nn.Module):
         self.head_dim = head_dim
         self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
 
+        # On AMD aiter, pad the value head dim up to the qk head dim so attention
+        # runs the symmetric (qk == v) fast path. Projections / o_proj stay at the
+        # real v_head_dim; only the attention call and KV cache see the padded dim.
+        self.pad_v_head_dim = (
+            self.v_head_dim < self.head_dim and mimo_v2_pads_v_head_dim()
+        )
+        self.attn_v_head_dim = (
+            self.head_dim if self.pad_v_head_dim else self.v_head_dim
+        )
+
         self.q_size = self.num_heads * self.head_dim
         self.k_size = self.num_kv_heads * self.head_dim
         self.v_size = self.num_kv_heads * self.v_head_dim
@@ -533,7 +561,7 @@ class MiMoV2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            v_head_dim=self.v_head_dim,
+            v_head_dim=self.attn_v_head_dim,
             sliding_window_size=sliding_window_size,  # if is -1 ,normal attention,else ,window attention
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -543,6 +571,21 @@ class MiMoV2Attention(nn.Module):
             torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
             if attention_sink_bias
             else None
+        )
+
+    def _pad_v(self, v: torch.Tensor) -> torch.Tensor:
+        if not self.pad_v_head_dim:
+            return v
+        v = v.view(-1, self.num_kv_heads, self.v_head_dim)
+        v = F.pad(v, (0, self.attn_v_head_dim - self.v_head_dim))
+        return v.reshape(-1, self.num_kv_heads * self.attn_v_head_dim)
+
+    def _unpad_attn_output(self, attn_output: torch.Tensor) -> torch.Tensor:
+        if not self.pad_v_head_dim:
+            return attn_output
+        attn_output = attn_output.view(-1, self.num_heads, self.attn_v_head_dim)
+        return attn_output[..., : self.v_head_dim].reshape(
+            -1, self.num_heads * self.v_head_dim
         )
 
     def op_prepare(self, state):
@@ -571,6 +614,7 @@ class MiMoV2Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         if self.v_scale is not None:
             v = v * self.v_scale
+        v = self._pad_v(v)
 
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
@@ -583,6 +627,7 @@ class MiMoV2Attention(nn.Module):
             *inner_state,
             sinks=self.attention_sink_bias,
         )
+        attn_output = self._unpad_attn_output(attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -601,7 +646,9 @@ class MiMoV2Attention(nn.Module):
 
         if self.v_scale is not None:
             v = v * self.v_scale
+        v = self._pad_v(v)
         attn_output = self.attn(q, k, v, forward_batch, sinks=self.attention_sink_bias)
+        attn_output = self._unpad_attn_output(attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 
