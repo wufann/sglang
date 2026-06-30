@@ -1508,13 +1508,25 @@ class MHATokenToKVPool(KVCache):
             self._get_value_buffer(i).nbytes
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
-        kv_item_lens = [
-            self._get_key_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ] + [
-            self._get_value_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ]
+        if self.kv_cache_layout == "vectorized_5d":
+            # 5D SHUFFLE buffer first axis is num_blocks; buffer[0] is already one
+            # whole block (== one page), since page_size is an inner dim. Do NOT
+            # multiply by page_size again (that overcounts item_len by page_size×).
+            kv_item_lens = [
+                self._get_key_buffer(i)[0].nbytes
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ] + [
+                self._get_value_buffer(i)[0].nbytes
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
+        else:
+            kv_item_lens = [
+                self._get_key_buffer(i)[0].nbytes * self.page_size
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ] + [
+                self._get_value_buffer(i)[0].nbytes * self.page_size
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def get_cpu_copy(self, indices, mamba_indices=None):
