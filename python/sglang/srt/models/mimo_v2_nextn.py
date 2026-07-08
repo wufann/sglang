@@ -251,6 +251,23 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
+        # For quark, if the MTP/nextn layer is kept unquantized and listed in the
+        # checkpoint's `exclude` set, drop quant for the whole nextn model so every
+        # submodule (eh_proj, attn, mlp) is built to match the unquantized ckpt.
+        # MiMo-V2.5-Pro-MXFP4 excludes the entire `model.mtp.layers.{idx}` block,
+        # while the main body is mxfp4; the MTP weights stay in their original
+        # (non-mxfp4) format, so building them with mxfp4-packed shapes would fail
+        # the shape assertion in the weight loader.
+        if quant_config is not None and quant_config.get_name() == "quark":
+            from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
+        
+            mtp_idx = draft_model_idx if draft_model_idx is not None else 0
+            ckpt_prefix = f"model.mtp.layers.{mtp_idx}"
+            excludes = getattr(quant_config, "exclude_layers", None) or []
+            if should_ignore_layer(ckpt_prefix, excludes) or any(
+                str(p).startswith(ckpt_prefix + ".") for p in excludes
+            ):
+                quant_config = None
         self.quant_config = quant_config
 
         self.model = MiMoV2ModelNextN(
