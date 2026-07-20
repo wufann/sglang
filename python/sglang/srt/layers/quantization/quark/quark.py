@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.quark.schemes import (
     QuarkMoEScheme,
     QuarkW4A4MXFP4,
     QuarkW4A4MXFp4MoE,
+    QuarkW8A8BlockFp8,
     QuarkW8A8Fp8,
     QuarkW8A8FP8MoE,
 )
@@ -322,6 +323,41 @@ class QuarkConfig(QuantizationConfig):
         is_per_tensor_activation = input_quant.get("qscheme") == "per_tensor"
         return is_per_tensor_activation
 
+    def _is_fp8_w8a8_block(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        # Block-scale FP8: static block-quantized weight (per_group with a
+        # block size, e.g. 128) + dynamic per-group activation. Distinct from
+        # per_tensor/per_channel fp8 (_is_fp8_w8a8) and from mxfp4 (fp4 dtype).
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_fp8_dtype = (
+            weight_quant.get("dtype") == "fp8_e4m3"
+            and input_quant.get("dtype") == "fp8_e4m3"
+        )
+        is_block_weight = weight_quant.get("qscheme") == "per_group"
+        is_static_weight = not weight_quant.get("is_dynamic")
+        is_dynamic_activation = bool(input_quant.get("is_dynamic"))
+
+        return (
+            is_fp8_dtype
+            and is_block_weight
+            and is_static_weight
+            and is_dynamic_activation
+        )
+
+    def _get_block_size_from_config(
+        self, weight_quant: dict[str, Any]
+    ) -> list[int]:
+        block_size = weight_quant.get("block_size")
+        if block_size is not None:
+            return list(block_size)
+        group_size = weight_quant.get("group_size", 128)
+        return [group_size, group_size]
+
     def _is_mx_fp4(
         self,
         weight_quant: Optional[dict[str, Any]],
@@ -434,6 +470,12 @@ class QuarkConfig(QuantizationConfig):
                 input_config,
                 is_checkpoint_mxfp4_serialized=self.is_prequantized,
             )
+        if self._is_fp8_w8a8_block(weight_config, input_config):
+            is_block_fp8_supported = self._check_scheme_supported(
+                QuarkW8A8BlockFp8.get_min_capability(), error=False
+            )
+            if is_block_fp8_supported:
+                return QuarkW8A8BlockFp8(weight_config, input_config)
         if self._is_fp8_w8a8(weight_config, input_config):
             is_fp8_w8a8_supported = self._check_scheme_supported(
                 QuarkW8A8Fp8.get_min_capability(), error=False
