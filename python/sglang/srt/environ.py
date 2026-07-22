@@ -207,6 +207,10 @@ class Envs:
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
+    # dtype for the MiMoV2 MoE gate (router) weight. "float32" (default) keeps
+    # the router in fp32 for numerical stability; "bfloat16" trades a little
+    # precision for a faster/smaller gate matmul.
+    SGLANG_MIMO_GATE_DTYPE = EnvStr("float32")
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)

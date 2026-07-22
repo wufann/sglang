@@ -89,8 +89,12 @@ def forward_extend_vectorized_5d(
         forward_batch.extend_prefix_lens_cpu
     )
     if extend_no_prefix:
-        k_lin = k.contiguous().view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-        v_lin = v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim)
+        # q/k/v are split(dim=-1) slices of the fused qkv: non-contiguous in
+        # the token stride but stride(-1)==1. aiter's LINEAR kernel consumes
+        # that layout natively (it only requires a contiguous last dim), so
+        # reshape zero-copy via view() instead of forcing a full contiguous().
+        k_lin = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v_lin = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
         total_tokens = k_lin.shape[0]
         kv_indices_lin = torch.arange(
             total_tokens, dtype=torch.int32, device=k_lin.device
@@ -98,7 +102,7 @@ def forward_extend_vectorized_5d(
         kv_indptr_lin = backend.qo_indptr[:bs0]
         max_q = int(backend.forward_metadata.max_q_len)
         o = mha_batch_prefill_func(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            q.view(-1, layer.tp_q_head_num, layer.head_dim),
             k_lin,
             v_lin,
             backend.qo_indptr[:bs0],
@@ -185,7 +189,7 @@ def forward_extend_vectorized_5d(
     max_q = int(backend.forward_metadata.max_q_len)
 
     o = mha_batch_prefill_func(
-        q_local.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+        q_local.view(-1, layer.tp_q_head_num, layer.head_dim),
         k_lin,
         v_lin,
         backend.qo_indptr[:bs0],
