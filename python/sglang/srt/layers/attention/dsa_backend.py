@@ -537,9 +537,7 @@ class DeepseekSparseAttnBackend(
             q_dtype,
             kv_dtype,
             is_sparse=True,
-            fast_mode=False,
-            num_kv_splits=self.aiter_dsa_max_split_per_batch,
-            intra_batch_mode=True,
+            fast_mode=True,
         )
 
         return (
@@ -618,9 +616,19 @@ class DeepseekSparseAttnBackend(
         self.aiter_dsa_kv_last_page_lens[:bs].fill_(1)
         kv_last_page_lens = self.aiter_dsa_kv_last_page_lens[:bs]
 
+        # aiter derives the batch count from seqlens_kv_indptr.size(0)-1
+        # (csrc/kernels/mla/metadata/v1_0_device.cuh:194). self.kv_indptr is the
+        # full [max_bs+1] buffer, so passing it unsliced makes the metadata build
+        # num_batches = max_bs workers even when bs < max_bs. During CUDA graph
+        # capture (bs sweeps 64->56->48...), the extra workers bs..max_bs-1 read
+        # stale kv_indptr slots left from the previous (larger) capture, so the
+        # persistent decode kernel streams KV past the written region -> GPU
+        # memory-access fault. bf16 KV never hits this: it skips this persistent
+        # metadata path entirely. Slice to [:bs+1] to match qo_indptr's length,
+        # mirroring ATOM (set_mla_persistent_worker_buffers slices both to bs+1).
         get_mla_metadata_v1(
             qo_indptr,
-            kv_indptr,
+            kv_indptr[: bs + 1],
             kv_last_page_lens,
             self.num_head_padded,
             1,
@@ -635,14 +643,17 @@ class DeepseekSparseAttnBackend(
             kv_granularity=16,
             max_seqlen_qo=max_seqlen_q,
             uni_seqlen_qo=max_seqlen_q,
-            fast_mode=False,
-            topk=self.dsa_index_topk,
-            max_split_per_batch=self.aiter_dsa_max_split_per_batch,
-            intra_batch_mode=True,
+            fast_mode=True,
             dtype_q=q_dtype,
             dtype_kv=kv_dtype,
         )
 
+        # Match ATOM's sglang sparse-MLA decode call (sparse_mla_indexer.py:460):
+        # fast_mode metadata + num_kv_splits left at aiter's default (None) so the
+        # persistent-decode gate (_use_persistent_mla_decode) selects the kernel.
+        # Passing an explicit num_kv_splits forces the experts-only split path,
+        # and fast_mode=False builds a work-metadata layout the gfx950 fp8 decode
+        # kernel misreads -> out-of-bounds.
         return {
             "kv_last_page_lens": kv_last_page_lens,
             "work_meta_data": self.aiter_dsa_work_metadata,
@@ -651,8 +662,6 @@ class DeepseekSparseAttnBackend(
             "reduce_indptr": self.aiter_dsa_reduce_indptr,
             "reduce_final_map": self.aiter_dsa_reduce_final_map,
             "reduce_partial_map": self.aiter_dsa_reduce_partial_map,
-            "intra_batch_mode": True,
-            "num_kv_splits": self.aiter_dsa_max_split_per_batch,
         }
 
     def _build_paged_mqa_schedule_2d_ctx_lens(
@@ -2973,6 +2982,13 @@ class DeepseekSparseAttnBackend(
         aiter_persistent_kwargs = {}
         if kv_cache.dtype == fp8_dtype:
             kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+            # aiter's gfx950 MLA decode registry only has fp8-q/fp8-kv kernels at
+            # qSeqLen=1 (mla_a8w8_qh16_qseqlen1_gqaratio16); the bf16-q/fp8-kv
+            # variant exists only at qSeqLen=4. Passing bf16 q here misses the
+            # heuristic lookup and faults. Cast q to fp8 with an identity scale
+            # to match the identity kv_scale the cache is stored under.
+            q_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+            q_kernel = q_kernel.to(fp8_dtype)
 
         kv_indptr = self.kv_indptr
 
@@ -3051,6 +3067,13 @@ class DeepseekSparseAttnBackend(
         aiter_persistent_kwargs = {}
         if kv_cache.dtype == fp8_dtype:
             kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+            # aiter's gfx950 MLA decode registry only has fp8-q/fp8-kv kernels at
+            # qSeqLen=1 (mla_a8w8_qh16_qseqlen1_gqaratio16); the bf16-q/fp8-kv
+            # variant exists only at qSeqLen=4. Passing bf16 q here misses the
+            # heuristic lookup and faults. Cast q to fp8 with an identity scale
+            # to match the identity kv_scale the cache is stored under.
+            q_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+            q_kernel = q_kernel.to(fp8_dtype)
 
         non_minus1_mask = page_table_1 != -1
         non_minus1_counts = non_minus1_mask.sum(dim=1)
