@@ -305,6 +305,10 @@ class DeepseekSparseAttnBackend(
     ):
         super().__init__()
         self.forward_metadata: DSAMetadata
+        # Aiter DSA persistent-decode metadata built once per forward (in the
+        # metadata-init paths) and shared across all layers; None means the
+        # per-layer fallback in _forward_aiter is used (hisparse / non-fp8).
+        self._aiter_persistent_decode_kwargs: Optional[dict] = None
         self.device = model_runner.device
         assert isinstance(model_runner.page_size, int)
         self.real_page_size = model_runner.page_size
@@ -663,6 +667,66 @@ class DeepseekSparseAttnBackend(
             "reduce_final_map": self.aiter_dsa_reduce_final_map,
             "reduce_partial_map": self.aiter_dsa_reduce_partial_map,
         }
+
+    def _maybe_build_aiter_persistent_decode_metadata(
+        self, metadata: "DSAMetadata", bs: int, forward_mode: ForwardMode
+    ) -> None:
+        """Build the aiter persistent metadata once per forward.
+
+        The aiter get_mla_metadata_v1 output depends only on the batch seqlen
+        layout (qo_indptr + kv_indptr counts), which is layer-independent for
+        both decode and prefill: dsa_cache_seqlens = min(seqlen, topk) is derived
+        purely from query positions + topk, so the canonical dsa_cu_seqlens_k is
+        identical across layers. Building it here (once, before the layer loop)
+        instead of inside the per-layer _forward_aiter / _forward_aiter_extend
+        cuts get_mla_metadata_v1 launches from num_layers to 1 per forward (and
+        removes it from the captured decode graph).
+
+        Only wired for the aiter + fp8 path without hisparse (hisparse builds
+        page_table_1 per layer, so its KV counts may differ across layers).
+        Decode/idle uses dsa_decode_impl; non-speculative extend (prefill) uses
+        dsa_prefill_impl and is left per-layer otherwise. Speculative extend
+        (target_verify / draft_extend_v2) keeps the per-layer fallback.
+        """
+        if not (
+            _is_hip
+            and self.kv_cache_dtype == fp8_dtype
+            and self.hisparse_coordinator is None
+        ):
+            self._aiter_persistent_decode_kwargs = None
+            return
+
+        if forward_mode.is_decode_or_idle() and self.dsa_decode_impl == "aiter":
+            self._aiter_persistent_decode_kwargs = (
+                self._prepare_aiter_dsa_decode_metadata(
+                    metadata.dsa_cu_seqlens_q,
+                    metadata.dsa_cu_seqlens_k,
+                    bs,
+                    metadata.max_seq_len_q,
+                    fp8_dtype,
+                    self.kv_cache_dtype,
+                )
+            )
+        elif (
+            forward_mode.is_extend_without_speculative()
+            and self.dsa_prefill_impl == "aiter"
+        ):
+            # Extend treats each query token as an independent seq_len_q=1 entry,
+            # so the metadata "batch" is the expanded token count and max_seqlen_q
+            # is 1 -- mirrors _forward_aiter_extend's per-token cu_seqlens_q.
+            num_tokens = metadata.dsa_cu_seqlens_q.shape[0] - 1
+            self._aiter_persistent_decode_kwargs = (
+                self._prepare_aiter_dsa_decode_metadata(
+                    metadata.dsa_cu_seqlens_q,
+                    metadata.dsa_cu_seqlens_k,
+                    num_tokens,
+                    1,
+                    fp8_dtype,
+                    self.kv_cache_dtype,
+                )
+            )
+        else:
+            self._aiter_persistent_decode_kwargs = None
 
     def _build_paged_mqa_schedule_2d_ctx_lens(
         self,
@@ -1083,6 +1147,9 @@ class DeepseekSparseAttnBackend(
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
         )
         self.forward_metadata = metadata
+        self._maybe_build_aiter_persistent_decode_metadata(
+            metadata, batch_size, forward_batch.forward_mode
+        )
 
     def _cal_indexer_k_start_end(
         self,
@@ -1412,6 +1479,7 @@ class DeepseekSparseAttnBackend(
         )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
+        self._maybe_build_aiter_persistent_decode_metadata(metadata, bs, forward_mode)
 
     def _apply_cuda_graph_metadata(
         self,
@@ -1718,6 +1786,7 @@ class DeepseekSparseAttnBackend(
             )
 
         self.forward_metadata = metadata
+        self._maybe_build_aiter_persistent_decode_metadata(metadata, bs, forward_mode)
 
     def init_forward_metadata_replay_cuda_graph_from_precomputed(
         self,
@@ -1880,6 +1949,7 @@ class DeepseekSparseAttnBackend(
                 metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
 
         self.forward_metadata = metadata
+        self._maybe_build_aiter_persistent_decode_metadata(metadata, bs, forward_mode)
 
     def forward_extend(
         self,
@@ -2185,6 +2255,7 @@ class DeepseekSparseAttnBackend(
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 layer=layer,
+                metadata=metadata,
             )
         else:
             raise ValueError(
@@ -2990,25 +3061,35 @@ class DeepseekSparseAttnBackend(
             q_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
             q_kernel = q_kernel.to(fp8_dtype)
 
-        kv_indptr = self.kv_indptr
-
-        non_minus1_mask = page_table_1 != -1
-        non_minus1_counts = non_minus1_mask.sum(dim=1)
-        kv_indptr[1 : bs + 1] = torch.cumsum(non_minus1_counts, dim=0)
+        prebuilt_kwargs = self._aiter_persistent_decode_kwargs
+        if prebuilt_kwargs is not None:
+            # Metadata was built once for this forward; kv_indptr counts are
+            # layer-independent, so reuse the canonical dsa_cu_seqlens_k instead
+            # of recomputing it from this layer's page_table_1.
+            kv_indptr = metadata.dsa_cu_seqlens_k
+        else:
+            kv_indptr = self.kv_indptr
+            non_minus1_mask = page_table_1 != -1
+            non_minus1_counts = non_minus1_mask.sum(dim=1)
+            kv_indptr[1 : bs + 1] = torch.cumsum(non_minus1_counts, dim=0)
 
         kv_indices = self.kv_indices
         get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
 
         kv_last_page_lens = metadata.cu_seqlens_q
         if kv_cache.dtype == fp8_dtype:
-            aiter_persistent_kwargs = self._prepare_aiter_dsa_decode_metadata(
-                metadata.cu_seqlens_q,
-                kv_indptr,
-                bs,
-                metadata.max_seq_len_q,
-                q_kernel.dtype,
-                kv_cache.dtype,
-            )
+            if prebuilt_kwargs is not None:
+                # Shallow copy so the pop below does not mutate the shared dict.
+                aiter_persistent_kwargs = dict(prebuilt_kwargs)
+            else:
+                aiter_persistent_kwargs = self._prepare_aiter_dsa_decode_metadata(
+                    metadata.cu_seqlens_q,
+                    kv_indptr,
+                    bs,
+                    metadata.max_seq_len_q,
+                    q_kernel.dtype,
+                    kv_cache.dtype,
+                )
             kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
 
         mla_decode_fwd(
@@ -3038,6 +3119,7 @@ class DeepseekSparseAttnBackend(
         kv_cache: torch.Tensor,
         page_table_1: torch.Tensor,
         layer: RadixAttention,
+        metadata: DSAMetadata,
     ) -> torch.Tensor:
         num_tokens = q_all.shape[0]
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
@@ -3075,11 +3157,29 @@ class DeepseekSparseAttnBackend(
             q_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
             q_kernel = q_kernel.to(fp8_dtype)
 
-        non_minus1_mask = page_table_1 != -1
-        non_minus1_counts = non_minus1_mask.sum(dim=1)
+        prebuilt_kwargs = self._aiter_persistent_decode_kwargs
+        if prebuilt_kwargs is not None:
+            # Metadata was built once for this forward; the per-token KV counts
+            # are layer-independent, so reuse the canonical dsa_cu_seqlens_k /
+            # dsa_cu_seqlens_q instead of recomputing them from this layer's
+            # page_table_1. get_valid_kv_indices still runs per layer because the
+            # selected token ids differ across layers.
+            assert num_tokens == metadata.dsa_cu_seqlens_q.shape[0] - 1
+            kv_indptr = metadata.dsa_cu_seqlens_k
+            cu_seqlens_q = metadata.dsa_cu_seqlens_q
+        else:
+            non_minus1_mask = page_table_1 != -1
+            non_minus1_counts = non_minus1_mask.sum(dim=1)
 
-        kv_indptr = torch.zeros(num_tokens + 1, dtype=torch.int32, device=self.device)
-        kv_indptr[1:] = torch.cumsum(non_minus1_counts, dim=0)
+            kv_indptr = torch.zeros(
+                num_tokens + 1, dtype=torch.int32, device=self.device
+            )
+            kv_indptr[1:] = torch.cumsum(non_minus1_counts, dim=0)
+
+            # Build cu_seqlens_q for extend: each token is treated as seq_len_q=1
+            cu_seqlens_q = torch.arange(
+                0, num_tokens + 1, dtype=torch.int32, device=self.device
+            )
 
         # Allocate kv_indices with upper-bound size (num_tokens * topk)
         topk = page_table_1.shape[1]
@@ -3090,20 +3190,20 @@ class DeepseekSparseAttnBackend(
         # Use get_valid_kv_indices kernel to extract valid indices
         get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, num_tokens)
 
-        # Build cu_seqlens_q for extend: each token is treated as seq_len_q=1
-        cu_seqlens_q = torch.arange(
-            0, num_tokens + 1, dtype=torch.int32, device=self.device
-        )
         kv_last_page_lens = cu_seqlens_q
         if kv_cache.dtype == fp8_dtype:
-            aiter_persistent_kwargs = self._prepare_aiter_dsa_decode_metadata(
-                cu_seqlens_q,
-                kv_indptr,
-                num_tokens,
-                1,
-                q_kernel.dtype,
-                kv_cache.dtype,
-            )
+            if prebuilt_kwargs is not None:
+                # Shallow copy so the pop below does not mutate the shared dict.
+                aiter_persistent_kwargs = dict(prebuilt_kwargs)
+            else:
+                aiter_persistent_kwargs = self._prepare_aiter_dsa_decode_metadata(
+                    cu_seqlens_q,
+                    kv_indptr,
+                    num_tokens,
+                    1,
+                    q_kernel.dtype,
+                    kv_cache.dtype,
+                )
             kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
 
         # TODO support more forward_mode
