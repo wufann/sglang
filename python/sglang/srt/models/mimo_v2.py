@@ -79,10 +79,12 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     ceil_align,
+    is_hip,
     is_non_idle_and_non_empty,
     make_layers,
 )
@@ -630,6 +632,17 @@ class MiMoV2Attention(nn.Module):
         self.head_dim = head_dim
         self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
 
+        # aiter SHUFFLE 5D KV kernels assume symmetric K/V head sizes. For
+        # MiMoV2 (qk=192, v=128) pad V up to head_dim for the KV cache /
+        # attention only; projections (qkv split, o_proj) keep the real
+        # v_head_dim, and the padded columns are sliced off the attn output.
+        self.pad_v = (
+            self.v_head_dim != self.head_dim
+            and is_hip()
+            and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
+        )
+        self.attn_v_head_dim = self.head_dim if self.pad_v else self.v_head_dim
+
         self.q_size = self.num_heads * self.head_dim
         self.k_size = self.num_kv_heads * self.head_dim
         self.v_size = self.num_kv_heads * self.v_head_dim
@@ -678,7 +691,7 @@ class MiMoV2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            v_head_dim=self.v_head_dim,
+            v_head_dim=self.attn_v_head_dim,
             sliding_window_size=sliding_window_size,  # if is -1 ,normal attention,else ,window attention
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -689,6 +702,17 @@ class MiMoV2Attention(nn.Module):
             if attention_sink_bias
             else None
         )
+
+    def _pad_v(self, v: torch.Tensor) -> torch.Tensor:
+        # (T, num_kv_heads * v_head_dim) -> (T, num_kv_heads * head_dim), zero-pad.
+        v = v.view(-1, self.num_kv_heads, self.v_head_dim)
+        v = F.pad(v, (0, self.attn_v_head_dim - self.v_head_dim))
+        return v.reshape(-1, self.num_kv_heads * self.attn_v_head_dim)
+
+    def _unpad_attn_output(self, o: torch.Tensor) -> torch.Tensor:
+        # (T, num_heads * head_dim) -> (T, num_heads * v_head_dim), drop pad cols.
+        o = o.view(-1, self.num_heads, self.attn_v_head_dim)[..., : self.v_head_dim]
+        return o.reshape(-1, self.num_heads * self.v_head_dim)
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -717,6 +741,9 @@ class MiMoV2Attention(nn.Module):
         if self.v_scale is not None:
             v = v * self.v_scale
 
+        if self.pad_v:
+            v = self._pad_v(v)
+
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -728,6 +755,8 @@ class MiMoV2Attention(nn.Module):
             *inner_state,
             sinks=self.attention_sink_bias,
         )
+        if self.pad_v:
+            attn_output = self._unpad_attn_output(attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -746,7 +775,11 @@ class MiMoV2Attention(nn.Module):
 
         if self.v_scale is not None:
             v = v * self.v_scale
+        if self.pad_v:
+            v = self._pad_v(v)
         attn_output = self.attn(q, k, v, forward_batch, sinks=self.attention_sink_bias)
+        if self.pad_v:
+            attn_output = self._unpad_attn_output(attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 

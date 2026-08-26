@@ -822,6 +822,21 @@ class ModelConfig:
             self.head_dim != self.v_head_dim or self.swa_head_dim != self.swa_v_head_dim
         )
 
+    @property
+    def pad_asymmetric_v_to_head_dim(self) -> bool:
+        """Whether to zero-pad V up to the K head dim for the KV cache.
+
+        The aiter SHUFFLE 5D kernels (writer/gather + pa_decode_gluon) assume a
+        single head_size for K and V, so asymmetric-KV models (e.g. MiMoV2
+        192/128) must store and attend over a symmetric V. Only engages on the
+        ROCm aiter ``vectorized_5d`` layout; every other path keeps native V.
+        """
+        return (
+            self.has_asymmetric_kv
+            and is_hip()
+            and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
+        )
+
     def _detect_attention_sinks(self) -> bool:
         """Check whether the model uses learned attention sinks.
 

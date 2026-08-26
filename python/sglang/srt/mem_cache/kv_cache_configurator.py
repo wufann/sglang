@@ -678,6 +678,12 @@ class KVCacheConfigurator:
             swa_head_dim = head_dim
             swa_v_head_dim = head_dim
 
+        if self.model_config.pad_asymmetric_v_to_head_dim:
+            # aiter SHUFFLE 5D needs symmetric K/V; store V padded to the K head
+            # dim (the model pads the V tensor and slices the output back).
+            v_head_dim = head_dim
+            swa_v_head_dim = swa_head_dim
+
         # Filter layer ids to this worker's [start_layer, end_layer) range.
         swa_attention_layer_ids = [
             i
@@ -1470,6 +1476,11 @@ class KVCacheConfigurator:
                 "swa_v_head_dim": self.model_config.swa_v_head_dim,
                 "v_head_dim": self.model_config.v_head_dim,
             }
+            if self.model_config.pad_asymmetric_v_to_head_dim:
+                # aiter SHUFFLE 5D needs symmetric K/V; store V padded to the K
+                # head dim (the model pads the V tensor + slices the output).
+                kwargs["v_head_dim"] = self.model_config.head_dim
+                kwargs["swa_v_head_dim"] = self.model_config.swa_head_dim
         swa_pool_class = (
             MHATokenToKVPoolMXFP8
             if self.kv_cache_dtype_str == "mxfp8"
