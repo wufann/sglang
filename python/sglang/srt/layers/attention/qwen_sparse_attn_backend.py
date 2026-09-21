@@ -30,6 +30,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_rope_position_matrix,
     compressed_decode_view,
 )
+from sglang.srt.layers.attention.qsa.paged_sparse_decode import qsa_sparse_paged_gqa
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
@@ -39,9 +40,19 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_packed_decode_triton,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _use_qsa_paged_decode() -> bool:
+    """Route QSA HIP decode through the ported ATOM paged split-K kernel.
+
+    Reads the token-level KV pool directly (page_size=1, req_to_token as the
+    block table) and skips the compaction launch. Off by default.
+    """
+    return get_bool_env_var("SGLANG_QSA_PAGED_DECODE")
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
@@ -1676,6 +1687,43 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch,
             topk,
         )
+        if _use_qsa_paged_decode() and is_hip():
+            # Read the token-level pool directly as a page_size=1 paged cache
+            # (req_to_token is the block table) and skip compaction entirely.
+            # Mask by validity (same rule as _fa2_valid_counts), not column
+            # position: the indexer's valid entries need not be front-packed,
+            # and the kernel skips any -1 wherever it sits.
+            seq_len_col = sequence_lens.to(torch.int32)[:, None]
+            valid_mask = (topk_indices >= 0) & (topk_indices < seq_len_col)
+            logical_indices = torch.where(
+                valid_mask, topk_indices, topk_indices.new_full((), -1)
+            ).contiguous()
+            k_buffer_paged = k_buffer.view(
+                k_buffer.shape[0], 1, k_buffer.shape[1], k_buffer.shape[2]
+            )
+            v_buffer_paged = v_buffer.view(
+                v_buffer.shape[0], 1, v_buffer.shape[1], v_buffer.shape[2]
+            )
+            token_to_request = (
+                (
+                    metadata.row_req_pool_indices
+                    if metadata.row_req_pool_indices is not None
+                    else forward_batch.req_pool_indices
+                )
+                .to(torch.int32)
+                .contiguous()
+            )
+            output = qsa_sparse_paged_gqa(
+                q.contiguous(),
+                k_buffer_paged,
+                v_buffer_paged,
+                logical_indices,
+                self.req_to_token_pool.req_to_token,
+                token_to_request,
+                softmax_scale=layer.scaling,
+                num_decode_requests=batch,
+            )
+            return output.reshape(q.shape[0], -1)
         scratch_capacity = (
             self._cuda_graph_max_tokens * topk
             if metadata.is_cuda_graph
