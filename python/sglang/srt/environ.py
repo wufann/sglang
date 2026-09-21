@@ -840,6 +840,13 @@ class Envs:
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
+    # Above 8192 tokens of context, aiter's non-static workspace is large
+    # enough that mem_fraction_static is scaled by 0.85 to leave room for it.
+    # Set this to honor an explicitly passed --mem-fraction-static instead.
+    # Off by default: the reserve is load-bearing and skipping it can OOM
+    # long-context aiter serving. Set only when the scaled fraction is itself
+    # too small to hold the model weights.
+    SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION = EnvBool(False)
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
